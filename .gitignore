@@ -1,0 +1,49 @@
+# --- secrets (never commit) ---
+.env
+**/credentials.json
+**/token.json
+**/*.token.json
+
+# Generated client configs that contain INLINED literal secrets live OUTSIDE the
+# repo (~/Library/..., ~/.kimi/, etc.). The in-repo .mcp.json / .cursor/mcp.json
+# keep ${refs} only and ARE committed.
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# --- runtime data + generated artifacts ---
+**/data/
+**/output/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- node ---
+node_modules/
+
+# --- os ---
+.DS_Store
+
+# --- downloaded binaries (re-fetched in setup) ---
+bin/
+
+# --- generated, machine-specific client configs (run `node mcp/generate.mjs`) ---
+.mcp.json
+.cursor/
+.codeium/
+*.orig-mcp.bak
+
+# --- generated project-context files (written by codeindex.export_context_file) ---
+CLAUDE.md
+AGENTS.md
+.windsurfrules
+.rules
+.github/copilot-instructions.md

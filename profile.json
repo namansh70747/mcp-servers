@@ -1,0 +1,51 @@
+{
+  "name": "Naman Sharma",
+  "email": "",
+  "phone": "",
+  "location": "",
+  "links": {
+    "github": "",
+    "linkedin": "",
+    "website": "",
+    "twitter": ""
+  },
+  "headline": "Early-career software developer",
+  "summary": "",
+  "skills": {
+    "languages": [],
+    "frameworks": [],
+    "tools": []
+  },
+  "experience": [
+    {
+      "company": "",
+      "role": "",
+      "start": "",
+      "end": "",
+      "highlights": []
+    }
+  ],
+  "projects": [
+    {
+      "name": "",
+      "tagline": "",
+      "description": "",
+      "tech": [],
+      "link": "",
+      "highlights": []
+    }
+  ],
+  "education": [
+    {
+      "school": "",
+      "degree": "",
+      "start": "",
+      "end": "",
+      "details": ""
+    }
+  ],
+  "outreach": {
+    "default_template": "internship_cto",
+    "signature": ""
+  }
+}
