@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Weekly outreach trigger for launchd.
+  Install:
+    cp automation/com.naman.mcp.outreach.plist ~/Library/LaunchAgents/
+    # edit the two ABSOLUTE paths below to match your machine, then:
+    launchctl load ~/Library/LaunchAgents/com.naman.mcp.outreach.plist
+  Disable:  launchctl unload ~/Library/LaunchAgents/com.naman.mcp.outreach.plist
+  Runs Mondays at 09:00. Logs to ~/.mcp-suite/outreach.{out,err}.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.naman.mcp.outreach</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/namansharma/mcp-servers/automation/run_outreach.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/namansharma/.mcp-suite/outreach.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/namansharma/.mcp-suite/outreach.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/namansharma/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
