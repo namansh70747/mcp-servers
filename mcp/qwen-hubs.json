@@ -1,0 +1,64 @@
+{
+  "mcpServers": {
+    "dev-hub": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/Users/namansharma/mcp-servers/runner",
+        "run-mcp-hub",
+        "dev"
+      ],
+      "env": {
+        "MCP_SUITE_ROOT": "/Users/namansharma/mcp-servers"
+      }
+    },
+    "outreach-hub": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/Users/namansharma/mcp-servers/runner",
+        "run-mcp-hub",
+        "outreach"
+      ],
+      "env": {
+        "MCP_SUITE_ROOT": "/Users/namansharma/mcp-servers"
+      }
+    },
+    "career-hub": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/Users/namansharma/mcp-servers/runner",
+        "run-mcp-hub",
+        "career"
+      ],
+      "env": {
+        "MCP_SUITE_ROOT": "/Users/namansharma/mcp-servers"
+      }
+    },
+    "prod-hub": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/Users/namansharma/mcp-servers/runner",
+        "run-mcp-hub",
+        "prod"
+      ],
+      "env": {
+        "MCP_SUITE_ROOT": "/Users/namansharma/mcp-servers"
+      }
+    },
+    "system-hub": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "/Users/namansharma/mcp-servers/runner",
+        "run-mcp-hub",
+        "system"
+      ],
+      "env": {
+        "MCP_SUITE_ROOT": "/Users/namansharma/mcp-servers"
+      }
+    }
+  }
+}

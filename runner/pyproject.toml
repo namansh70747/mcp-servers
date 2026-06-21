@@ -1,0 +1,47 @@
+[project]
+name = "mcp-suite-runner"
+version = "0.1.5"
+description = "uvx-compatible launcher for the custom MCP server suite (Qwen Desktop / any uvx-only client)."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "mcp-base",
+    "httpx>=0.27",
+    "feedparser>=6.0",
+    "beautifulsoup4>=4.12",
+    "dnspython>=2.6",
+    "email-validator>=2.1",
+    "jinja2>=3.1",
+    "google-api-python-client>=2.0",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+    "python-pptx>=0.6",
+    "python-docx>=1.1",
+    "markdown>=3.6",
+    "PyGithub>=2.3",
+    "GitPython>=3.1",
+    "watchdog>=4.0",
+    "pathspec>=0.12",
+    "python-dotenv>=1.0",
+    # webscrape content extraction + browser automation (so the hub has them under uvx too)
+    "trafilatura>=1.6",
+    "markdownify>=0.11",
+    "playwright>=1.40",
+    # local semantic embeddings for webengine hybrid search (free, ~30MB, no torch)
+    "model2vec>=0.3",
+]
+
+[project.scripts]
+run-mcp-server = "mcp_runner:main"
+run-mcp-hub = "mcp_runner:hub_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_runner"]
+
+# mcp-base lives in ../shared — uvx resolves this relative to this pyproject.toml
+[tool.uv.sources]
+mcp-base = { path = "../shared", editable = true }

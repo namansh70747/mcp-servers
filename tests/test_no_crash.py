@@ -21,7 +21,7 @@ from fastmcp import Client  # noqa: E402
 SKIP_SERVERS = {
     "mac-control", "homebrew", "gitflow", "codeedit", "scaffold",
     "apollo", "funding-radar", "news-radar", "email-finder", "github-profile",
-    "reachout", "mailbox", "mailmerge",
+    "reachout", "mailbox", "mailmerge", "spotify", "webscrape", "browser", "webengine",
 }
 # Per-tool skips (network calls or writes) inside otherwise-fuzzed servers.
 SKIP_TOOL_SUBSTR = (
