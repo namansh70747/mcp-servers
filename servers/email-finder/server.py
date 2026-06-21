@@ -14,7 +14,7 @@ import re
 import smtplib
 import string
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 from mcp_base import BaseStore, data_dir, db_path, get_env, http, make_server
@@ -39,9 +39,11 @@ def _is_internal_host(host: str) -> bool:
 
 mcp = make_server(
     "email-finder",
-    instructions=("Free email resolution. find(name, company, domain) orchestrates everything; "
-                  "guess() for patterns, verify() to check deliverability, from_github() for devs, "
-                  "scrape_site() to harvest published emails, bulk_find() for batches."),
+    instructions=("Free email resolution. find(name, company, domain) orchestrates everything "
+                  "(Hunter pattern + site scrape + GitHub + free web search + patterns, verifies all, "
+                  "returns best + ranked candidates[]); guess() for patterns, verify() to check "
+                  "deliverability, from_github() for devs, scrape_site() and search_web() to harvest "
+                  "published emails, bulk_find() for batches."),
 )
 
 SCHEMA = """
@@ -51,6 +53,9 @@ CREATE TABLE IF NOT EXISTS verify_cache(
 CREATE TABLE IF NOT EXISTS found_emails(
   id INTEGER PRIMARY KEY, name TEXT, domain TEXT, email TEXT, source TEXT, confidence TEXT,
   found_at TEXT, UNIQUE(email)
+);
+CREATE TABLE IF NOT EXISTS domain_patterns(
+  domain TEXT PRIMARY KEY, pattern TEXT, hits INTEGER DEFAULT 1, updated_at TEXT
 );
 """
 store = BaseStore(db_path("email-finder"), schema=SCHEMA)
@@ -128,24 +133,44 @@ def _is_disposable(domain: str) -> bool:
     return domain.lower() in DISPOSABLE_DOMAINS
 
 
-def _smtp_rcpt(host: str, email: str) -> int | None:
-    try:
-        with smtplib.SMTP(host, 25, timeout=10) as s:
-            s.helo("example.com")
-            s.mail("verify@example.com")
-            code, _ = s.rcpt(email)
+def _smtp_rcpt(host: str, email: str, ports: tuple = (25, 587, 465)) -> int | None:
+    """RCPT-probe a mailbox across common SMTP ports (25/587 plaintext, 465 SSL). First definitive
+    code wins; None if every port is blocked/unreachable."""
+    for port in ports:
+        try:
+            cls = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+            with cls(host, port, timeout=10) as s:
+                s.helo("example.com")
+                s.mail("verify@example.com")
+                code, _ = s.rcpt(email)
+                if code:
+                    return code
+        except Exception:
+            continue
+    return None
+
+
+def _smtp_probe(mx_hosts: list, email: str) -> int | None:
+    """Try the first few MX hosts in preference order; return the first definitive RCPT code."""
+    for host in (mx_hosts or [])[:3]:
+        code = _smtp_rcpt(host, email)
+        if code is not None:
             return code
-    except Exception:
-        return None
+    return None
 
 
-def _catch_all(host: str, domain: str) -> bool | None:
-    """Probe a random nonexistent local-part; if it's accepted, the domain is catch-all."""
-    rnd = "".join(random.choices(string.ascii_lowercase, k=16))
-    code = _smtp_rcpt(host, f"{rnd}@{domain}")
-    if code is None:
-        return None
-    return code in (250, 251)
+def _catch_all(mx_hosts: list, domain: str) -> bool | None:
+    """Catch-all only if TWO distinct random local-parts are both accepted (kills greylisting and
+    one-off false positives). None if any probe is inconclusive."""
+    accepts = 0
+    for _ in range(2):
+        rnd = "".join(random.choices(string.ascii_lowercase, k=16))
+        code = _smtp_probe(mx_hosts, f"{rnd}@{domain}")
+        if code is None:
+            return None
+        if code in (250, 251):
+            accepts += 1
+    return accepts == 2
 
 
 def _cache_get(email: str) -> dict | None:
@@ -282,8 +307,8 @@ def verify(email: str, check_smtp: bool = True, use_cache: bool = True) -> dict:
 
     # self-hosted SMTP RCPT probe + catch-all detection (best-effort; unreliable on big hosts)
     if check_smtp and not big:
-        host = mxinfo["mx"][0]
-        is_catch = _catch_all(host, domain)
+        mx_hosts = mxinfo["mx"][:3]
+        is_catch = _catch_all(mx_hosts, domain)
         if is_catch is not None:
             result["checks"]["catch_all"] = is_catch
         if is_catch:
@@ -291,7 +316,7 @@ def verify(email: str, check_smtp: bool = True, use_cache: bool = True) -> dict:
                           note="catch-all domain: any address accepted, cannot confirm mailbox")
             _cache_put(result)
             return result
-        code = _smtp_rcpt(host, email)
+        code = _smtp_probe(mx_hosts, email)
         if code is not None:
             result["checks"]["smtp"] = code
             if code in (250, 251):
@@ -349,21 +374,102 @@ def from_github(username: str, max_events: int = 30) -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     emails: dict[str, int] = {}
+    rate_limited = False
+
+    def _add(em: str, w: int = 1) -> None:
+        em = (em or "").strip().lower()
+        if em and "@" in em and "noreply.github.com" not in em and "users.noreply" not in em:
+            emails[em] = emails.get(em, 0) + w
+
+    def _get(url: str, params: dict | None = None):
+        nonlocal rate_limited
+        r = http.request("GET", url, headers=headers, params=params, timeout=20)
+        if r.get("status") in (403, 429):
+            rate_limited = True
+        return r.get("json") if r.get("status") == 200 else None
+
+    # 1) public push events (recent commit authors)
     try:
-        resp = http.request("GET", f"https://api.github.com/users/{username}/events/public",
-                            headers=headers, params={"per_page": max_events}, timeout=20)
-        if resp.get("status") != 200:
-            return {"username": username, "emails": [],
-                    "error": f"github {resp.get('status') or resp.get('error')}"}
-        for ev in resp.get("json", []) or []:
+        events = _get(f"https://api.github.com/users/{username}/events/public",
+                      {"per_page": max_events})
+        for ev in events or []:
             for commit in (ev.get("payload", {}) or {}).get("commits", []) or []:
-                em = (commit.get("author", {}) or {}).get("email", "")
-                if em and "noreply.github.com" not in em and "@" in em:
-                    emails[em] = emails.get(em, 0) + 1
-    except Exception as e:  # noqa: BLE001
-        return {"username": username, "emails": [], "error": str(e)}
+                _add((commit.get("author", {}) or {}).get("email", ""))
+    except Exception:
+        pass
+
+    # 2) public profile email (set by some users)
+    try:
+        prof = _get(f"https://api.github.com/users/{username}")
+        if isinstance(prof, dict):
+            _add(prof.get("email") or "", 3)
+    except Exception:
+        pass
+
+    # 3) commits the user authored in their recently-pushed repos
+    try:
+        repos = _get(f"https://api.github.com/users/{username}/repos",
+                     {"sort": "pushed", "per_page": 5}) or []
+        for repo in repos[:5]:
+            full = repo.get("full_name")
+            if not full:
+                continue
+            commits = _get(f"https://api.github.com/repos/{full}/commits",
+                           {"author": username, "per_page": 10}) or []
+            for c in commits:
+                _add(((c.get("commit", {}) or {}).get("author", {}) or {}).get("email", ""))
+    except Exception:
+        pass
+
     ranked = sorted(emails.items(), key=lambda kv: -kv[1])
-    return {"username": username, "emails": [{"email": e, "commits": n} for e, n in ranked]}
+    out: dict = {"username": username, "emails": [{"email": e, "commits": n} for e, n in ranked]}
+    if not emails and rate_limited:
+        out["error"] = "github rate-limited"
+    if rate_limited:
+        out["rate_limited"] = True
+    return out
+
+
+def _emails_from_html(html: str) -> dict[str, int]:
+    """Extract emails from one page's HTML: mailto links (weight 2) + plain-text matches (weight 1).
+    Returns {email: weight}. Lazy BeautifulSoup; falls back to regex on the raw text."""
+    found: dict[str, int] = {}
+    if not html:
+        return found
+    text = html
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.select("a[href^=mailto]"):
+            em = a.get("href", "")[7:].split("?")[0].strip().lower()
+            if em:
+                found[em] = found.get(em, 0) + 2  # mailto weighted higher
+        text = soup.get_text(" ")
+    except Exception:
+        pass
+    for em in EMAIL_RE.findall(text):
+        found[em.lower()] = found.get(em.lower(), 0) + 1
+    return found
+
+
+def _fetch_page_text(url: str, timeout: float = 15.0) -> str:
+    """Fetch one page's HTML, SSRF-guarded, html-only, size-capped, no redirects. '' on any failure."""
+    try:
+        full = url if url.startswith("http") else f"https://{url}"
+        parts = urlsplit(full)
+        if parts.scheme not in ("http", "https"):
+            return ""
+        host = (parts.hostname or "").lower()
+        if not host or _is_internal_host(host):
+            return ""
+        with httpx.Client(timeout=timeout, follow_redirects=False,
+                          headers={"User-Agent": "Mozilla/5.0 (mcp-suite email-finder)"}) as client:
+            r = client.get(full)
+            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
+                return ""
+            return r.text[:MAX_PAGE_BYTES]
+    except Exception:
+        return ""
 
 
 @mcp.tool
@@ -389,30 +495,13 @@ def scrape_site(domain: str, max_pages: int = 5) -> dict:
     paths = ["", "/about", "/about-us", "/team", "/contact", "/people", "/company", "/leadership"]
     found: dict[str, int] = {}
     pages_hit = 0
-    try:
-        from bs4 import BeautifulSoup
-    except Exception:
-        BeautifulSoup = None  # type: ignore
-    with httpx.Client(timeout=15, follow_redirects=False,
-                      headers={"User-Agent": "Mozilla/5.0 (mcp-suite email-finder)"}) as client:
-        for path in paths[:max_pages]:
-            try:
-                r = client.get(base.rstrip("/") + path)
-                if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
-                    continue
-                pages_hit += 1
-                text = r.text[:MAX_PAGE_BYTES]
-                if BeautifulSoup is not None:
-                    soup = BeautifulSoup(text, "html.parser")
-                    for a in soup.select("a[href^=mailto]"):
-                        em = a.get("href", "")[7:].split("?")[0].strip()
-                        if em:
-                            found[em] = found.get(em, 0) + 2  # mailto weighted higher
-                    text = soup.get_text(" ")
-                for em in EMAIL_RE.findall(text):
-                    found[em.lower()] = found.get(em.lower(), 0) + 1
-            except Exception:
-                continue
+    for path in paths[:max_pages]:
+        html = _fetch_page_text(base.rstrip("/") + path)
+        if not html:
+            continue
+        pages_hit += 1
+        for em, w in _emails_from_html(html).items():
+            found[em] = found.get(em, 0) + w
     on_domain = {e: n for e, n in found.items() if e.split("@")[-1].lower().endswith(host)}
     ranked = sorted((on_domain or found).items(), key=lambda kv: -kv[1])
     return {"domain": host, "pages_scanned": pages_hit,
@@ -441,6 +530,32 @@ def hunter_domain_search(domain: str, limit: int = 10) -> dict:
                        for e in (data.get("emails", []) or [])]}
 
 
+@mcp.tool
+def tomba_find(name: str, domain: str) -> dict:
+    """Tomba.io email finder (FREE 50/mo; needs TOMBA_API_KEY + TOMBA_SECRET). Returns the real
+    email Tomba has for a person at a domain, with a confidence score + the public sources it was
+    seen on. A genuine finder database (not just a guess). Graceful hint if no key."""
+    key, secret = get_env("TOMBA_API_KEY"), get_env("TOMBA_SECRET")
+    if not (key and secret):
+        return {"error": "no TOMBA_API_KEY/TOMBA_SECRET",
+                "hint": "Free 50/mo at tomba.io — sign up with a work/school email (Gmail is blocked), "
+                        "then add TOMBA_API_KEY + TOMBA_SECRET to .env and reconnect."}
+    first, last = _split_name(name)
+    dom = (domain or "").strip().lower().lstrip("@")
+    if not first or not dom:
+        return {"error": "need a name and a domain"}
+    try:
+        payload = http.get_json(f"https://api.tomba.io/v1/email-finder/{dom}",
+                                params={"first_name": first, "last_name": last},
+                                headers={"X-Tomba-Key": key, "X-Tomba-Secret": secret},
+                                timeout=20, cache_ttl=3600.0)
+        data = (payload or {}).get("data", {}) if isinstance(payload, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    return {"name": name, "domain": dom, "email": data.get("email"), "score": data.get("score"),
+            "sources": [s.get("uri") or s.get("url") for s in (data.get("sources") or [])][:5]}
+
+
 def _record_found(name: str, domain: str, email: str, source: str, confidence: str) -> None:
     try:
         store.execute(
@@ -450,55 +565,487 @@ def _record_found(name: str, domain: str, email: str, source: str, confidence: s
         pass
 
 
+def _decode_ddg_href(href: str) -> str:
+    """Resolve a DuckDuckGo result href to its real http(s) target, or '' if not usable.
+    DDG wraps targets as //duckduckgo.com/l/?uddg=<urlencoded-target>."""
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    try:
+        parts = urlsplit(href)
+    except Exception:
+        return ""
+    if parts.path.startswith("/l/") or "uddg=" in (parts.query or ""):
+        target = (parse_qs(parts.query).get("uddg") or [""])[0]
+        return unquote(target) if target else ""
+    if parts.scheme in ("http", "https") and parts.hostname and "duckduckgo.com" not in parts.hostname:
+        return href
+    return ""
+
+
+def _ddg_result_links(query: str, max_links: int = 5) -> list[str]:
+    """Keyless DuckDuckGo HTML search -> decoded result target URLs. [] on failure/rate-limit."""
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    links: list[str] = []
+    for endpoint in ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"):
+        try:
+            html_text = http.get_text(endpoint, params={"q": query}, headers=headers,
+                                      timeout=20, cache_ttl=900.0)
+            if not html_text:
+                continue
+            try:
+                from bs4 import BeautifulSoup
+                anchors = [a.get("href", "") for a in BeautifulSoup(html_text, "html.parser")
+                           .find_all("a", href=True)]
+            except Exception:
+                anchors = re.findall(r'href="([^"]+)"', html_text)
+            for href in anchors:
+                u = _decode_ddg_href(href)
+                if u and u not in links:
+                    links.append(u)
+                if len(links) >= max_links:
+                    break
+            if links:
+                break
+        except Exception:
+            continue
+    return links[:max_links]
+
+
+_BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+_SEARCH_HOST_HINTS = ("duckduckgo.com", "bing.com", "mojeek.com", "google.", "yahoo.com",
+                      "microsoft.com", "msn.com")
+
+
+def _decode_bing_u(u: str) -> str:
+    """Decode Bing's /ck/a 'u' redirect param (base64url, 'a1' prefix). '' on failure."""
+    import base64
+    try:
+        if u.startswith("a1"):
+            u = u[2:]
+        return base64.urlsafe_b64decode(u + "=" * (-len(u) % 4)).decode("utf-8", "ignore")
+    except Exception:
+        return ""
+
+
+def _norm_result_link(href: str) -> str:
+    """Normalize a Bing/Mojeek result href to an external http(s) URL, or '' to skip.
+    Unwraps Bing /ck/a redirects; rejects internal hosts and search-engine self-links."""
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    try:
+        parts = urlsplit(href)
+    except Exception:
+        return ""
+    if "bing.com" in (parts.hostname or "").lower() and parts.path.startswith("/ck/"):
+        href = _decode_bing_u((parse_qs(parts.query).get("u") or [""])[0])
+        if not href:
+            return ""
+    try:
+        p = urlsplit(href if href.startswith("http") else "https://" + href)
+    except Exception:
+        return ""
+    h = (p.hostname or "").lower()
+    if (p.scheme not in ("http", "https") or not h or _is_internal_host(h)
+            or any(s in h for s in _SEARCH_HOST_HINTS)):
+        return ""
+    return href
+
+
+def _engine_links(url: str, params: dict, selectors: list[str], max_links: int) -> list[str]:
+    """Run one keyless search engine, parse result anchors, return normalized target URLs."""
+    html_text = http.get_text(url, params=params, headers={"User-Agent": _BROWSER_UA},
+                              timeout=20, cache_ttl=900.0)
+    if not html_text:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        anchors: list = []
+        for sel in selectors:
+            anchors = soup.select(sel)
+            if anchors:
+                break
+        hrefs = [a.get("href", "") for a in (anchors or soup.find_all("a", href=True))]
+    except Exception:
+        hrefs = re.findall(r'href="([^"]+)"', html_text)
+    links: list[str] = []
+    for href in hrefs:
+        u = _norm_result_link(href)
+        if u and u not in links:
+            links.append(u)
+        if len(links) >= max_links:
+            break
+    return links
+
+
+def _bing_links(query: str, max_links: int = 5) -> list[str]:
+    try:
+        return _engine_links("https://www.bing.com/search", {"q": query},
+                             ["li.b_algo h2 a", "h2 a"], max_links)
+    except Exception:
+        return []
+
+
+def _mojeek_links(query: str, max_links: int = 5) -> list[str]:
+    try:
+        return _engine_links("https://www.mojeek.com/search", {"q": query},
+                             ["a.ob", "ul.results-standard li a", "h2 a"], max_links)
+    except Exception:
+        return []
+
+
+def _search_links(query: str, max_links: int = 5) -> list[str]:
+    """Find result URLs via DuckDuckGo -> Bing -> Mojeek (all keyless). First non-empty wins; one
+    engine breaking never breaks search. [] if all fail/rate-limited."""
+    for fn in (_ddg_result_links, _bing_links, _mojeek_links):
+        try:
+            links = fn(query, max_links)
+        except Exception:
+            links = []
+        if links:
+            return links[:max_links]
+    return []
+
+
+def _web_search_emails(name: str, domain: str = "", company: str = "",
+                       max_results: int = 8) -> list[dict]:
+    """Discover a person's published emails via keyless DuckDuckGo search. Never raises; [] on fail.
+    Keeps only emails whose local-part matches the name or that sit on the target domain."""
+    first, last = _split_name(name)
+    if not first:
+        return []
+    dom = (domain or "").lower().lstrip("@")
+    queries = []
+    if dom:
+        queries.append(f'"{name}" "@{dom}"')
+    if company:
+        queries.append(f'"{name}" {company} email')
+    queries.append(f'"{name}" email contact')
+    urls: list[str] = []
+    for q in queries:
+        for u in _search_links(q, max_links=5):
+            if u not in urls:
+                urls.append(u)
+        if len(urls) >= max_results:
+            break
+    out: dict[str, dict] = {}
+    for url in urls[:max_results]:
+        html_text = _fetch_page_text(url)
+        if not html_text:
+            continue
+        for em, w in _emails_from_html(html_text).items():
+            local, _, edom = em.partition("@")
+            on_domain = bool(dom) and edom.lower().endswith(dom)
+            name_match = (first and first in local) or (last and last in local)
+            if not (on_domain or name_match):
+                continue
+            score = w + (3 if on_domain else 0) + (2 if name_match else 0)
+            cur = out.get(em)
+            if not cur or score > cur["weight"]:
+                out[em] = {"email": em, "source_url": url, "weight": score,
+                           "role": _is_role(em), "on_domain": on_domain}
+    return sorted(out.values(), key=lambda d: -d["weight"])
+
+
+def _wayback_emails(domain: str, name: str, max_snaps: int = 4) -> list[dict]:
+    """Recover emails from a domain's archived about/team/contact pages via the Wayback Machine
+    CDX API (free, keyless). Never raises; [] on failure."""
+    dom = (domain or "").strip().lower().lstrip("@")
+    if not dom:
+        return []
+    first, last = _split_name(name)
+    try:
+        rows = http.get_json("http://web.archive.org/cdx/search/cdx",
+                             params={"url": f"{dom}/*", "output": "json",
+                                     "filter": "statuscode:200", "collapse": "urlkey",
+                                     "limit": 40, "fl": "timestamp,original"},
+                             timeout=20, cache_ttl=3600.0)
+    except Exception:
+        return []
+    if not isinstance(rows, list) or len(rows) < 2:
+        return []
+    wanted = re.compile(r"/(about|team|contact|people|leadership|staff|company)", re.I)
+    snaps: list[tuple] = []
+    for row in rows[1:]:  # row 0 is the CDX header
+        try:
+            ts, original = row[0], row[1]
+        except (IndexError, TypeError):
+            continue
+        if wanted.search(original or ""):
+            snaps.append((ts, original))
+        if len(snaps) >= max_snaps:
+            break
+    out: dict[str, dict] = {}
+    for ts, original in snaps:
+        html_text = _fetch_page_text(f"https://web.archive.org/web/{ts}id_/{original}")
+        if not html_text:
+            continue
+        for em, w in _emails_from_html(html_text).items():
+            local, _, edom = em.partition("@")
+            on_domain = edom.lower().endswith(dom)
+            name_match = (first and first in local) or (last and last in local)
+            if not (on_domain or name_match):
+                continue
+            score = w + (3 if on_domain else 0) + (2 if name_match else 0)
+            cur = out.get(em)
+            if not cur or score > cur["weight"]:
+                out[em] = {"email": em, "source_url": f"web.archive.org/{ts}", "weight": score,
+                           "role": _is_role(em), "on_domain": on_domain}
+    return sorted(out.values(), key=lambda d: -d["weight"])
+
+
+@mcp.tool
+def search_web(name: str, domain: str = "", company: str = "", max_results: int = 8) -> dict:
+    """Discover a person's published email anywhere on the web via a FREE, keyless DuckDuckGo
+    search (no API key). Fetches the top result pages and extracts emails that match the person or
+    the target domain. Returns ranked candidates with their source URLs."""
+    try:
+        max_results = max(1, min(int(max_results), 15))
+    except (TypeError, ValueError):
+        max_results = 8
+    return {"name": name, "domain": domain, "company": company,
+            "results": _web_search_emails(name, domain, company, max_results)}
+
+
+def _render_hunter_pattern(pattern: str, first: str, last: str) -> str:
+    """Render a local-part pattern (e.g. '{first}.{last}', '{f}{last}') for a name. Empty if unusable."""
+    if not pattern or not first:
+        return ""
+    local = (pattern.replace("{first}", first).replace("{last}", last)
+                    .replace("{f}", first[:1]).replace("{l}", last[:1] if last else ""))
+    return local.strip(".-_").replace("..", ".")
+
+
+# Canonical local-part templates (same set as _patterns), in _render_hunter_pattern's language.
+_PATTERN_TEMPLATES = ["{first}.{last}", "{first}", "{f}{last}", "{first}{last}", "{first}_{last}",
+                      "{f}.{last}", "{first}{l}", "{first}-{last}", "{last}.{first}", "{last}{first}",
+                      "{last}{f}", "{l}{first}", "{last}"]
+PATTERN_TTL_DAYS = 180
+
+
+def _infer_pattern(local: str, first: str, last: str) -> str | None:
+    """Reverse of _render_hunter_pattern: which template produced `local` for this name? None if unsure.
+    Requires both first and last (a single-name local can't pin down an org's format)."""
+    local = (local or "").strip().lower()
+    if not local or not first or not last:
+        return None
+    for tmpl in _PATTERN_TEMPLATES:
+        if _render_hunter_pattern(tmpl, first, last) == local:
+            return tmpl
+    return None
+
+
+def _learn_pattern(domain: str, pattern: str) -> None:
+    """Remember a domain's confirmed local-part pattern (upsert, bump hit count)."""
+    domain = (domain or "").strip().lower().lstrip("@")
+    if not domain or not pattern:
+        return
+    try:
+        store.execute(
+            "INSERT INTO domain_patterns(domain,pattern,hits,updated_at) VALUES(?,?,1,?) "
+            "ON CONFLICT(domain) DO UPDATE SET pattern=excluded.pattern, hits=hits+1, "
+            "updated_at=excluded.updated_at", (domain, pattern, _now()))
+    except Exception:
+        pass
+
+
+def _learned_pattern(domain: str) -> str | None:
+    """Return a domain's learned pattern, unless it's stale (> PATTERN_TTL_DAYS) or missing."""
+    domain = (domain or "").strip().lower().lstrip("@")
+    if not domain:
+        return None
+    try:
+        row = store.query_one("SELECT pattern, updated_at FROM domain_patterns WHERE domain=?",
+                              (domain,))
+        if not row or not row.get("pattern"):
+            return None
+        updated = datetime.fromisoformat(row["updated_at"])
+        if datetime.now(timezone.utc) - updated > timedelta(days=PATTERN_TTL_DAYS):
+            return None
+        return row["pattern"]
+    except Exception:
+        return None
+
+
+# Higher = a more trustworthy origin for the address.
+_SOURCE_RANK = {"learned": 6, "site": 5, "web": 5, "github": 5, "wayback": 5, "tomba": 5,
+                "hunter-known": 4, "hunter-pattern": 4, "pattern": 1}
+# Sources where the address was actually observed published (vs synthesized from a name+pattern).
+_REAL_PUBLISHED = {"site", "web", "github", "hunter-known", "wayback", "tomba"}
+
+
+def _score_candidate(cand: dict) -> tuple:
+    """Rank key: verified-deliverable, then origin trust, then corroboration, confidence, weight."""
+    v = cand.get("verify") or {}
+    deliver = v.get("deliverable")
+    deliver_rank = 2 if deliver is True else (1 if deliver is None else 0)
+    src_rank = _SOURCE_RANK.get(cand.get("source", "pattern"), 1)
+    conf = {"high": 3, "medium": 2, "low": 1, "inconclusive": 1, "none": 0}.get(
+        cand.get("confidence", ""), 0)
+    return (deliver_rank, src_rank, min(cand.get("corrob", 1), 3), conf, cand.get("weight", 0))
+
+
 @mcp.tool
 def find(name: str, company: str = "", domain: str = "", github: str = "",
          scrape: bool = True) -> dict:
-    """Orchestrate the full free flow: site scrape -> GitHub commits -> pattern guesses -> verify ->
-    best email with a confidence label. Returns the best candidate plus all evidence. Cached."""
+    """Resolve the best free work email for a person. Gathers candidates from a learned domain
+    pattern, Hunter's confirmed pattern, the company site, GitHub commits, a free multi-engine web
+    search, the Wayback Machine, and name+domain patterns; verifies them all; returns the best —
+    plus a ranked candidates[] list with evidence. Learns each domain's format as it goes."""
     evidence: dict = {"name": name, "company": company, "domain": domain}
     first, last = _split_name(name)
+    dom = (domain or "").lower().lstrip("@")
+    raw: list[tuple[str, str]] = []  # (email, source)
 
-    # 1) scrape the company site for a published address matching the person
-    if scrape and domain:
-        site = scrape_site(domain)
+    def _add(email: str, source: str) -> None:
+        email = (email or "").strip().lower()
+        if email and "@" in email and not _is_disposable(email.split("@", 1)[1]):
+            raw.append((email, source))
+
+    # 0) a previously-learned pattern for this domain (free, no API call, highest priority)
+    learned = _learned_pattern(dom) if dom else None
+    if learned:
+        rendered = _render_hunter_pattern(learned, first, last)
+        if rendered:
+            evidence["learned"] = {"pattern": learned}
+            _add(f"{rendered}@{dom}", "learned")
+
+    # 1) Hunter's confirmed pattern + known emails (skipped if we already learned this domain)
+    if dom and not learned and get_env("HUNTER_API_KEY"):
+        h = hunter_domain_search(dom)
+        evidence["hunter"] = h
+        if isinstance(h, dict):
+            hp = h.get("pattern") or ""
+            if hp:
+                _learn_pattern(dom, hp)  # remember Hunter's pattern for next time
+            rendered = _render_hunter_pattern(hp, first, last)
+            if rendered:
+                _add(f"{rendered}@{dom}", "hunter-pattern")
+            for e in h.get("emails", []) or []:
+                ev = (e.get("email") or "")
+                local = ev.split("@", 1)[0].lower()
+                if ev and ((first and first in local) or (last and last in local)):
+                    _add(ev, "hunter-known")
+
+    # 1b) Tomba finder database (free 50/mo, returns a real address)
+    if dom and get_env("TOMBA_API_KEY") and get_env("TOMBA_SECRET"):
+        t = tomba_find(name, dom)
+        evidence["tomba"] = t
+        if isinstance(t, dict) and t.get("email"):
+            _add(t["email"], "tomba")
+
+    # 2) company site (published address matching the person)
+    if scrape and dom:
+        site = scrape_site(dom)
         evidence["site"] = site
         for item in site.get("emails", []):
             local = item["email"].split("@", 1)[0].lower()
-            if not item["role"] and (first and first in local or last and last in local):
-                v = verify(item["email"])
-                if v.get("deliverable") is not False:
-                    _record_found(name, domain, item["email"], "site", v.get("confidence", "medium"))
-                    return {"best": item["email"], "source": "site-scrape",
-                            "confidence": v.get("confidence", "medium"), "verify": v,
-                            "evidence": evidence}
+            if not item["role"] and ((first and first in local) or (last and last in local)):
+                _add(item["email"], "site")
 
-    # 2) GitHub (often the real address directly)
+    # 3) GitHub commit emails (often the real address directly)
     if github:
         gh = from_github(github)
         evidence["github"] = gh
-        if gh.get("emails"):
-            best = gh["emails"][0]["email"]
-            v = verify(best)
-            if v.get("deliverable") is not False:
-                _record_found(name, domain, best, "github", v.get("confidence", "medium"))
-                return {"best": best, "source": "github", "confidence": v.get("confidence", "medium"),
-                        "verify": v, "evidence": evidence}
+        for e in (gh.get("emails", []) or [])[:3]:
+            _add(e["email"], "github")
 
-    # 3) pattern + verify
-    if domain:
-        cands = _patterns(name, domain)
-        evidence["candidates"] = cands
-        for c in cands[:5]:
-            v = verify(c)
-            if v.get("deliverable") is True:
-                _record_found(name, domain, c, "pattern+verify", v["confidence"])
-                return {"best": c, "source": "pattern+verify", "confidence": v["confidence"],
-                        "verify": v, "evidence": evidence}
-        if cands:
-            return {"best": cands[0], "source": "pattern-only", "confidence": "low",
-                    "note": "unverified best-guess", "evidence": evidence}
-    return {"best": None, "confidence": "none",
-            "note": "need a domain (and/or github username) to resolve", "evidence": evidence}
+    # 4) free multi-engine web search anywhere on the web
+    web = _web_search_emails(name, dom, company)
+    if web:
+        evidence["web"] = web
+        for item in web[:5]:
+            if not item["role"]:
+                _add(item["email"], "web")
+
+    # 5) Wayback Machine archived about/team/contact pages
+    if dom:
+        wb = _wayback_emails(dom, name)
+        if wb:
+            evidence["wayback"] = wb
+            for item in wb[:5]:
+                if not item["role"]:
+                    _add(item["email"], "wayback")
+
+    # 6) generic name+domain patterns (fallback)
+    if dom:
+        pats = _patterns(name, dom)
+        evidence["patterns"] = pats
+        for p in pats:
+            _add(p, "pattern")
+
+    # dedup: track ALL sources per email (for corroboration), keep first-seen order
+    sources_for: dict[str, list[str]] = {}
+    order: list[str] = []
+    for email, source in raw:
+        if email not in sources_for:
+            sources_for[email] = []
+            order.append(email)
+        if source not in sources_for[email]:
+            sources_for[email].append(source)
+
+    # verify highest-trust candidates first so the budget never starves learned/real-published ones
+    order.sort(key=lambda e: -max(_SOURCE_RANK.get(s, 1) for s in sources_for[e]))
+    VERIFY_CAP = 12
+    url_for: dict[str, str] = {}
+    for key in ("web", "wayback"):
+        for w in (evidence.get(key) or []):
+            url_for.setdefault(w["email"], w.get("source_url"))
+
+    candidates: list[dict] = []
+    for email in order[:VERIFY_CAP]:
+        srcs = sources_for[email]
+        best_src = max(srcs, key=lambda s: _SOURCE_RANK.get(s, 1))
+        corrob = len(srcs)
+        v = verify(email)
+        deliver = v.get("deliverable")
+        conf, note = v.get("confidence"), None
+        # corroboration: same address from >=2 sources incl. a real-published one -> lift from None
+        if deliver is None and corrob >= 2 and any(s in _REAL_PUBLISHED for s in srcs):
+            conf, note = "medium", "corroborated by multiple sources"
+        if any(b in email.split("@", 1)[1].lower() for b in BIG_HOSTS):
+            conf, note = "inconclusive", "provider blocks probing"  # honest about Gmail/M365 walls
+        candidates.append({"email": email, "source": best_src, "sources": srcs, "corrob": corrob,
+                           "weight": 0, "verify": v, "deliverable": deliver, "confidence": conf,
+                           "note": note, "source_url": url_for.get(email)})
+
+    ranked = sorted(candidates, key=_score_candidate, reverse=True)
+    viable = [c for c in ranked if c["deliverable"] is not False]
+    pool = viable or ranked
+
+    out_candidates = [{"email": c["email"], "source": c["source"], "sources": c["sources"],
+                       "deliverable": c["deliverable"], "confidence": c["confidence"],
+                       "source_url": c["source_url"]} for c in ranked]
+
+    if not pool:
+        if dom:  # nothing verifiable but we can still offer a best-guess pattern
+            pats = _patterns(name, dom)
+            if pats:
+                return {"best": pats[0], "source": "pattern-only", "confidence": "low",
+                        "note": "unverified best-guess", "candidates": out_candidates,
+                        "evidence": evidence}
+        return {"best": None, "confidence": "none",
+                "note": "need a domain (and/or github username) to resolve", "evidence": evidence}
+
+    top = pool[0]
+    _record_found(name, dom or top["email"].split("@", 1)[1], top["email"],
+                  top["source"], top["confidence"] or "low")
+    # learn this domain's format whenever we confirmed a real mailbox from a name-derived address
+    if dom and top["deliverable"] is True:
+        tmpl = _infer_pattern(top["email"].split("@", 1)[0], first, last)
+        if tmpl:
+            _learn_pattern(dom, tmpl)
+    result = {"best": top["email"], "source": top["source"], "confidence": top["confidence"] or "low",
+              "verify": top["verify"], "candidates": out_candidates, "evidence": evidence}
+    if top["note"]:
+        result["note"] = top["note"]
+    return result
 
 
 # Contacts schema mirrored from servers/contacts (kept in sync; unique by (email, company)).

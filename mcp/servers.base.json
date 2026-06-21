@@ -62,17 +62,18 @@
       "note": "Persistent cross-session knowledge graph."
     },
 
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "platform": "any",
+      "note": "Browser automation: navigate/click/type/fill/screenshot a real Chromium (e.g. open YouTube and play, fill forms, scrape). Free, keyless. First run auto-downloads the browser."
+    },
+
     "applescript": {
       "command": "npx",
       "args": ["-y", "@peakmojo/applescript-mcp"],
       "platform": "macos",
       "note": "Universal Mac app + System Events control (keystone). Needs Automation permission."
-    },
-    "macos-use": {
-      "command": "npx",
-      "args": ["-y", "mcp-server-macos-use"],
-      "platform": "macos",
-      "note": "UI automation via accessibility tree. Needs Accessibility permission + Xcode CLT."
     },
     "shortcuts": {
       "command": "npx",

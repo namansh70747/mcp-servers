@@ -3,7 +3,7 @@
 Import surface kept tiny on purpose:
     from mcp_base import make_server, BaseStore, data_dir, db_path, get_env
 """
-from . import http
+from . import embed, fetch, http, scrape
 from .app import make_server
 from .config import (
     base_data_dir,
@@ -39,4 +39,7 @@ __all__ = [
     "not_found",
     "get_logger",
     "http",
+    "scrape",
+    "fetch",
+    "embed",
 ]
