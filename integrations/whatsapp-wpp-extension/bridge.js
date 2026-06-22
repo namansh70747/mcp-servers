@@ -50,9 +50,12 @@
   };
 
   function reply(id, o) { o.id = id; set("data-wa-res", JSON.stringify(o)); }
+
+  // Process the current data-wa-cmd (dedup on the raw JSON so we run each command once).
   var seen = "";
-  setInterval(function () {
-    var cmd = root.getAttribute("data-wa-cmd");
+  function process() {
+    var cmd;
+    try { cmd = root.getAttribute("data-wa-cmd"); } catch (e) { return; }
     if (!cmd || cmd === seen) return;
     seen = cmd;
     var p; try { p = JSON.parse(cmd); } catch (e) { return; }
@@ -64,11 +67,25 @@
         if (!h) { reply(id, { ok: false, e: "unknown op: " + p.op }); return; }
         result = h.apply(null, p.args || []);
       } else if (typeof p.expr === "string") {
-        result = (0, eval)(p.expr); // primary RE tool; if CSP blocks this, we use named ops instead
+        result = (0, eval)(p.expr); // primary tool; if CSP ever blocks this, named ops still work
       } else { reply(id, { ok: false, e: "no op/expr" }); return; }
       Promise.resolve(result)
         .then(function (v) { reply(id, { ok: true, v: safe(v) }); })
         .catch(function (e) { reply(id, { ok: false, e: String((e && e.message) || e) }); });
     } catch (e) { reply(id, { ok: false, e: String((e && e.message) || e) }); }
-  }, 200);
+  }
+
+  // PRIMARY trigger: a MutationObserver on the data-wa-cmd attribute. The connector sets that attribute
+  // via a forced main-thread eval (`execute javascript`), which runs even when the tab is in the
+  // BACKGROUND; the observer callback is delivered as a microtask, and microtasks are NOT subject to
+  // Chrome's background-tab timer throttling. So the relay stays responsive without ever focusing the
+  // window. (A plain setInterval here would be throttled to ~1/min in a backgrounded tab — the bug we
+  // were hitting and papering over by force-focusing the tab.)
+  try {
+    new MutationObserver(process).observe(root, { attributes: true, attributeFilter: ["data-wa-cmd"] });
+  } catch (e) {}
+  // Belt-and-suspenders: a slow poll in case a mutation is ever missed (throttled when backgrounded,
+  // which is fine — the observer is the real workhorse).
+  setInterval(process, 1000);
+  process();
 })();

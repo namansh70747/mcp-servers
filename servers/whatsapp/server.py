@@ -28,13 +28,17 @@ from mcp_base import (BaseStore, Jobs, chrome, db_path, err, get_env, get_env_in
 
 mcp = make_server(
     "whatsapp",
-    instructions=("Robust WhatsApp via YOUR real Chrome (WPP engine; no QR). Talk to anyone by NAME or "
-                  "nickname — it fuzzy-matches your real contacts and asks 'did you mean?' when unsure, "
-                  "and LEARNS your pick. To sound like YOU: call contact_style(name) or compose(name, "
-                  "intent), write the message in that exact voice, then send(name, text, exact=true). "
-                  "Also react/read/media/groups/status/calls + memory (set_nickname, contact_memory, "
-                  "memory_digest). Run diagnose() first; load the WhatsApp WPP Bridge extension once if "
-                  "wpp_ready is false."),
+    instructions=("Robust WhatsApp via YOUR real Chrome (WPP engine; no QR). Runs fully in the BACKGROUND "
+                  "— it never focuses/opens the WhatsApp window. Talk to anyone by NAME or nickname — it "
+                  "fuzzy-matches your real contacts and asks 'did you mean?' when unsure, and LEARNS your "
+                  "pick. To sound like YOU: call contact_style(name) or compose(name, intent), write the "
+                  "message in that exact voice, then send(name, text, exact=true). For a back-and-forth: "
+                  "send(), use the returned chat_id with wait_for_reply(chat_id=...) to get their reply, "
+                  "repeat. AUTOPILOT: when the user's prompt contains 'autopilot', carry the whole "
+                  "conversation without asking approval per message (send→wait_for_reply→reply, stopping "
+                  "on a stop-word/idle/max-turns); for hands-off/session-independent use, autopilot_brief() "
+                  "+ background.run(task=directive). Also react/read/media/groups/status + memory. Run "
+                  "diagnose() first; load the WhatsApp WPP Bridge extension once if wpp_ready is false."),
 )
 
 WA = "web.whatsapp.com"
@@ -44,6 +48,13 @@ WPP_TIMEOUT = max(5, get_env_int("WHATSAPP_WPP_TIMEOUT", 30) or 30)
 FUZZY_THRESHOLD = float(get_env("WHATSAPP_FUZZY_THRESHOLD", "0.72") or 0.72)
 MAX_MEDIA = 16 * 1024 * 1024
 MAX_MSG = 60000
+# "autopilot" autonomous-conversation limits (the agent talks without per-message approval).
+AUTOPILOT_STOPWORDS = [s.strip().lower() for s in (get_env(
+    "WHATSAPP_AUTOPILOT_STOPWORDS",
+    "bye,bye bye,ok bye,okay bye,goodbye,ttyl,talk later,gtg,good night,gn,stop,ruk,band karo") or "").split(",")
+    if s.strip()]
+AUTOPILOT_IDLE_TIMEOUT = max(30, get_env_int("WHATSAPP_AUTOPILOT_IDLE_TIMEOUT", 180) or 180)
+AUTOPILOT_MAX_TURNS = max(1, get_env_int("WHATSAPP_AUTOPILOT_MAX_TURNS", 40) or 40)
 JOBS = Jobs("whatsapp", max_concurrent=1, inline_wait=INLINE_WAIT)
 
 try:
@@ -255,15 +266,74 @@ def wpp_query_exists(number: str) -> tuple[bool, object]:
                    "{exists:true,id:(r.wid&&r.wid._serialized)||r._serialized||String(r)}:{exists:false};})")
 
 
+# Reusable JS to find a chat in ChatStore by serialized id / phone number / lid, then read its
+# ALREADY-LOADED messages SYNCHRONOUSLY. We avoid WPP.chat.getMessages() — that does a server fetch
+# that hangs on this build. ChatStore.get(...).msgs holds the recent messages and updates live over the
+# socket, so once a chat is active (e.g. right after we send to it), reads are instant + reliable.
+_FIND_CHAT = (
+    "function __findChat(ref){var CS=window.WPP.whatsapp.ChatStore,c=null;"
+    "try{c=CS.get(ref);}catch(e){}if(c)return c;"
+    "var num=String(ref).split('@')[0].replace(/\\D/g,'');var arr=CS.getModelsArray();"
+    "for(var i=0;i<arr.length;i++){var x=arr[i];var id=(x.id&&x.id._serialized)||'';"
+    "var u=((x.id&&x.id.user)||'').replace(/\\D/g,'');var cu='';"
+    "try{cu=((x.contact&&x.contact.id&&x.contact.id.user)||'').replace(/\\D/g,'');}catch(e){}"
+    "if(id===ref||(num&&(u===num||cu===num||(num.length>=8&&(u.indexOf(num)>=0||cu.indexOf(num)>=0)))))return x;}"
+    "return null;}"
+)
+
+
+def _msgs_js(ref_json: str, count: int) -> str:
+    """A SYNC expression returning {found, chat, msgs:[{id,from_me,type,body,t}]} for a chat ref."""
+    return ("(function(){" + _FIND_CHAT + "var c=__findChat(" + ref_json + ");if(!c)return {found:false};"
+            "var ms=(c.msgs&&c.msgs.getModelsArray)?c.msgs.getModelsArray():[];"
+            "return {found:true,chat:(c.id&&c.id._serialized)||'',msgs:ms.slice(-" + str(int(count)) +
+            ").map(function(m){return {id:(m.id&&m.id._serialized)||'',from_me:!!(m.id&&m.id.fromMe),"
+            "type:m.type,body:(m.body||m.caption||''),t:m.t||0};})};})()")
+
+
+def wpp_chat_messages(chat_ref: str, count: int = 30) -> tuple[bool, object]:
+    """Recent messages of a chat (sync ChatStore). Returns (ok, {found, chat, msgs[]})."""
+    return wpp_raw(_msgs_js(j(chat_ref), count))
+
+
 def wpp_get_my_messages(chat_id: str, count: int = 80) -> tuple[bool, object]:
-    return wpp_raw(f"window.WPP.chat.getMessages({j(chat_id)},{{count:{int(count)}}}).then(function(ms){{"
-                   "return ms.filter(function(m){return m.id&&m.id.fromMe&&m.type==='chat'&&m.body;})"
-                   ".map(function(m){return {body:m.body,t:m.t||0};});})")
+    okr, val = wpp_chat_messages(chat_id, count)
+    if not okr:
+        return okr, val
+    if not (isinstance(val, dict) and val.get("found")):
+        return True, []
+    msgs = [{"body": m["body"], "t": m["t"]} for m in val.get("msgs", [])
+            if m.get("from_me") and m.get("type") == "chat" and m.get("body")]
+    return True, msgs
+
+
+def chat_id_from_msg_id(msg_id: str) -> str:
+    """A WPP message id is '<dir>_<chatId>_<hash>[_out]' — extract the chat id (works for @c.us/@lid)."""
+    parts = (msg_id or "").split("_")
+    return parts[1] if len(parts) >= 2 and ("@" in parts[1]) else ""
+
+
+def is_stopword(text: str) -> bool:
+    """True if a message is an autopilot stop signal (bye / ttyl / stop / …)."""
+    t = (text or "").strip().lower().strip(".!?…। ")
+    return t in AUTOPILOT_STOPWORDS
 
 
 def wpp_send_text(chat_id: str, text: str) -> tuple[bool, object]:
-    return wpp_raw(f"window.WPP.chat.sendTextMessage({j(chat_id)},{j(text)},{{createChat:true}})"
-                   ".then(function(r){return {sent:true,id:(r&&r.id)?String(r.id):''};})")
+    # WA >= 2.3000 keys chats by LID. Resolve @c.us → actual WID (may be @lid) before sending.
+    cid_js = j(chat_id)
+    txt_js = j(text)
+    expr = (
+        "(function(){var cid=" + cid_js + ",txt=" + txt_js + ";"
+        "function doSend(wid){return window.WPP.chat.sendTextMessage(wid,txt,{createChat:true})"
+        ".then(function(r){return {sent:true,id:(r&&r.id)?String(r.id):''}});}"
+        "if(cid.indexOf('@c.us')>=0){"
+        "return window.WPP.contact.queryExists(cid.split('@')[0])"
+        ".then(function(r){var wid=(r&&r.wid&&r.wid._serialized)||(r&&r._serialized)||cid;"
+        "return doSend(wid);}).catch(function(){return doSend(cid);});}"
+        "return doSend(cid);})()"
+    )
+    return wpp_raw(expr)
 
 
 # ============================================================ contact resolution
@@ -640,6 +710,12 @@ def send(contact: str, message: str, exact: bool = False, dry_run: bool = False)
             mem_learn_alias(contact, cid, label=name, source="confirmed", confidence=0.97)
             if THROTTLE:
                 time.sleep(THROTTLE)
+            res = val if isinstance(val, dict) else {"sent": True}
+            res.setdefault("sent", True)
+            # surface the resolved chat id (the @lid/@c.us the message actually landed in) so the caller
+            # can read / wait_for_reply on it reliably without re-resolving.
+            res["chat_id"] = chat_id_from_msg_id(res.get("id", "")) or cid
+            return okr, res
         return okr, (val if isinstance(val, dict) else {"sent": True})
     return _act("send", fn, contact_name=name, contact_id=cid)
 
@@ -652,9 +728,11 @@ def react(contact: str, emoji: str = "👍", exact: bool = False) -> dict:
     c, resp = _resolve(contact, exact)
     if resp and not c:
         return resp
-    expr = (f"window.WPP.chat.getMessages({j(c['id'])},{{count:1}}).then(function(ms){{"
-            "if(!ms.length)throw new Error('no messages');var id=ms[ms.length-1].id._serialized;"
-            f"return window.WPP.chat.sendReactionToMessage(id,{j(emoji)}).then(function(){{return {{reacted:true}};}});}})")
+    expr = ("(function(){" + _FIND_CHAT + f"var c=__findChat({j(c['id'])});"
+            "if(!c)throw new Error('chat not found');var ms=c.msgs.getModelsArray();"
+            "var last=ms[ms.length-1];if(!last)throw new Error('no messages');"
+            f"return window.WPP.chat.sendReactionToMessage(last.id._serialized,{j(emoji)})"
+            ".then(function(){return {reacted:true};});})()")
     return _act("react", lambda: wpp_raw(expr), contact_name=c.get("name", ""), contact_id=c["id"])
 
 
@@ -667,9 +745,90 @@ def read_chat(contact: str, limit: int = 20, exact: bool = False) -> dict:
     if resp and not c:
         return resp
     n = max(1, min(100, int(limit)))
-    expr = (f"window.WPP.chat.getMessages({j(c['id'])},{{count:{n}}}).then(function(ms){{return ms.map("
-            "function(m){return {fromMe:!!(m.id&&m.id.fromMe),type:m.type,body:m.body||'',t:m.t||0};});})")
-    return _act("read", lambda: wpp_raw(expr), contact_name=c.get("name", ""), contact_id=c["id"])
+
+    def fn():
+        okr, val = wpp_chat_messages(c["id"], n)
+        if not okr:
+            return False, val
+        if not (isinstance(val, dict) and val.get("found")):
+            return True, {"messages": [], "note": "chat not loaded yet — send a message or open it once"}
+        return True, {"chat": val.get("chat"), "messages": val.get("msgs", [])}
+    return _act("read", fn, contact_name=c.get("name", ""), contact_id=c["id"])
+
+
+@mcp.tool
+def wait_for_reply(contact: str = "", chat_id: str = "", after_id: str = "", timeout: int = 90,
+                   from_me: bool = False) -> dict:
+    """Block until the OTHER person sends a NEW message in a chat, then return it (or time out).
+    The autopilot loop primitive — one call == one conversational turn. Pass chat_id (from send()'s
+    result) for reliability, or a contact name/number to resolve. Reads the LIVE ChatStore (no hanging
+    server fetch); works fully in the background. `from_me` defaults False (their incoming message);
+    set True only for the lid 'message-yourself' chat where your own typing shows as fromMe:true."""
+    if (e := _need_ready()):
+        return e
+    ref = (chat_id or "").strip()
+    if not ref:
+        if not (contact or "").strip():
+            return err("contact or chat_id is required")
+        c, resp = _resolve(contact, True)
+        if resp and not c:
+            return resp
+        ref = c["id"]
+    timeout = max(5, min(240, int(timeout)))
+    # Baseline the current messages; we return the first NEW message from the wanted direction.
+    seen: set[str] = {after_id} if after_id else set()
+    okr, val = wpp_chat_messages(ref, 30)
+    if okr and isinstance(val, dict) and val.get("found"):
+        ref = val.get("chat") or ref
+        for m in val.get("msgs", []):
+            seen.add(m.get("id"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        okr, val = wpp_chat_messages(ref, 30)
+        if not (okr and isinstance(val, dict) and val.get("found")):
+            continue
+        for m in val.get("msgs", []):
+            mid = m.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            if bool(m.get("from_me")) is bool(from_me):
+                body = m.get("body", "")
+                mem_log("reply_in", ref, summary=body[:80])
+                return ok(message=body, id=mid, t=m.get("t", 0), from_me=m.get("from_me"),
+                          chat_id=ref, is_stop=is_stopword(body))
+    return ok(timeout=True, waited=timeout, chat_id=ref)
+
+
+@mcp.tool
+def autopilot_brief(contact: str, goal: str = "", exact: bool = False) -> dict:
+    """Build a ready-to-spawn directive for a DETACHED autopilot chat (pass to background.run(task=...)).
+    Returns the resolved contact + chat_id, the per-contact style profile, the recent thread, and a
+    'directive' string a headless agent can follow to carry the conversation on its own."""
+    if (e := _need_ready()):
+        return e
+    c, resp = _resolve(contact, exact)
+    if resp and not c:
+        return resp
+    style = style_get_or_build(c["id"])
+    okr, val = wpp_chat_messages(c["id"], 15)
+    recent = val.get("msgs", []) if (okr and isinstance(val, dict) and val.get("found")) else []
+    stops = ", ".join(AUTOPILOT_STOPWORDS)
+    directive = (
+        f"Hold a live WhatsApp conversation with {c.get('name') or contact} (whatsapp chat_id {c['id']}) "
+        f"using the `whatsapp` MCP tools. Goal/opener: {goal or 'just catch up naturally'}.\n"
+        f"Match this person's exact texting voice (see STYLE below) — short, natural, like the user, not "
+        f"like an assistant. LOOP: whatsapp.send(...) → whatsapp.wait_for_reply(chat_id=<chat_id returned "
+        f"by send>) → reply in their style → repeat. STOP when they say any of [{stops}], when "
+        f"wait_for_reply returns is_stop or timeout (no reply for ~{AUTOPILOT_IDLE_TIMEOUT}s), or after "
+        f"{AUTOPILOT_MAX_TURNS} turns. Keep it light; never send anything risky/irreversible.\n\n"
+        f"STYLE:\n{style.get('instruction', '')}\n\nRECENT (oldest→newest): "
+        f"{json.dumps(recent[-10:], ensure_ascii=False)}"
+    )
+    return ok(contact=c, chat_id=c["id"], style=style.get("profile"), recent=recent,
+              directive=directive, stopwords=AUTOPILOT_STOPWORDS,
+              hint="spawn with background.run(task=<directive>) for a hands-off, session-independent chat")
 
 
 @mcp.tool

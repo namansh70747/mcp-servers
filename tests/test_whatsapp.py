@@ -50,6 +50,7 @@ def _load(_n=[0]):
     m.wpp_query_exists = lambda num: (True, {"exists": True, "id": f"{num}@c.us"})
     m.wpp_send_text = lambda cid, text: (True, {"sent": True})
     m.wpp_raw = lambda expr, timeout=None: (True, {"ok": True})
+    m.wpp_chat_messages = lambda ref, count=30: (True, {"found": True, "chat": ref, "msgs": []})
     m.THROTTLE = 0
     return m
 
@@ -72,9 +73,9 @@ def test_registry():
     m = _load()
     expected = {"health", "diagnose", "setup", "resolve_contact", "set_nickname", "list_nicknames",
                 "forget", "contact_memory", "memory_digest", "contact_style", "compose", "send",
-                "react", "read_chat", "list_chats", "list_unread", "mark_read", "send_media",
-                "list_groups", "create_group", "add_to_group", "post_text_status", "start_call",
-                "end_call", "job_status", "list_jobs", "cancel_job"}
+                "react", "read_chat", "wait_for_reply", "autopilot_brief", "list_chats", "list_unread",
+                "mark_read", "send_media", "list_groups", "create_group", "add_to_group",
+                "post_text_status", "start_call", "end_call", "job_status", "list_jobs", "cancel_job"}
     assert expected <= _tools(m), sorted(expected - _tools(m))
     assert sum(1 for t in _tools(m) if t == "health") == 1
 
@@ -124,9 +125,51 @@ def test_validation_and_not_ready():
     assert nr["ok"] is False and "extension" in (nr.get("error") or "").lower(), nr
 
 
+def test_stopwords_and_chatid():
+    m = _load()
+    assert m.is_stopword("bye") and m.is_stopword("Ok Bye.") and m.is_stopword("TTYL")
+    assert not m.is_stopword("hello") and not m.is_stopword("bye for now buying milk")
+    # chat id is parsed out of a WPP message id
+    assert m.chat_id_from_msg_id("true_134265475977373@lid_3EB0ABC") == "134265475977373@lid"
+    assert m.chat_id_from_msg_id("false_916280852252@c.us_XYZ_out") == "916280852252@c.us"
+    assert m.chat_id_from_msg_id("garbage") == ""
+
+
+def test_wait_for_reply():
+    m = _load()
+    # stateful mock: baseline has only our own msg; next poll adds an incoming reply from the peer
+    state = {"polls": 0}
+    base = [{"id": "true_X@lid_OUR", "from_me": True, "type": "chat", "body": "yo", "t": 1}]
+
+    def fake(ref, count=30):
+        state["polls"] += 1
+        if state["polls"] <= 1:
+            return True, {"found": True, "chat": ref, "msgs": list(base)}
+        return True, {"found": True, "chat": ref, "msgs": base + [
+            {"id": "false_X@lid_THEIRS", "from_me": False, "type": "chat", "body": "bye", "t": 2}]}
+    m.wpp_chat_messages = fake
+    r = _call(m, "wait_for_reply", {"chat_id": "X@lid", "timeout": 12})
+    assert r["ok"] and r.get("message") == "bye" and r.get("from_me") is False, r
+    assert r.get("is_stop") is True, r  # "bye" is a stop word
+
+    # timeout path: no new peer message ever
+    m2 = _load()
+    m2.wpp_chat_messages = lambda ref, count=30: (True, {"found": True, "chat": ref, "msgs": list(base)})
+    rt = _call(m2, "wait_for_reply", {"chat_id": "X@lid", "timeout": 5})
+    assert rt["ok"] and rt.get("timeout") is True, rt
+
+
+def test_autopilot_brief():
+    m = _load()
+    r = _call(m, "autopilot_brief", {"contact": "Mom", "goal": "say hi"})
+    assert r["ok"] and r.get("chat_id") == "14155550001@c.us", r
+    assert "directive" in r and "wait_for_reply" in r["directive"] and r.get("stopwords"), r
+
+
 if __name__ == "__main__":
     for fn in (test_registry, test_resolution_fuzzy_and_nickname, test_send_learns_alias_and_ambiguity,
-               test_tone_style_engine, test_validation_and_not_ready):
+               test_tone_style_engine, test_validation_and_not_ready, test_stopwords_and_chatid,
+               test_wait_for_reply, test_autopilot_brief):
         fn()
         print(fn.__name__, "OK")
     print("ALL WHATSAPP TESTS PASSED")
