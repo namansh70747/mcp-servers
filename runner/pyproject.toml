@@ -1,6 +1,6 @@
 [project]
 name = "mcp-suite-runner"
-version = "0.1.8"
+version = "0.1.9"
 description = "uvx-compatible launcher for the custom MCP server suite (Qwen Desktop / any uvx-only client)."
 requires-python = ">=3.11"
 dependencies = [
@@ -33,6 +33,11 @@ dependencies = [
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    # voice server realtime engine (macOS only) — so the system hub can run voice calls under uvx too
+    "RealtimeSTT>=0.3; sys_platform == 'darwin'",
+    "RealtimeTTS[kokoro]>=0.4; sys_platform == 'darwin'",
+    "faster-whisper>=1.0; sys_platform == 'darwin'",
+    "sounddevice>=0.4; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

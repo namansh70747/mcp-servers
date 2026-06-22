@@ -24,6 +24,8 @@ dependencies = [
     "python-pptx>=0.6",
     "python-docx>=1.1",
     "markdown>=3.6",
+    # videoforge: render titles/captions as PNG overlays (works on any ffmpeg; no libfreetype needed)
+    "Pillow>=10.0",
     "PyGithub>=2.3",
     "GitPython>=3.1",
     # code intelligence / freshness
@@ -54,3 +56,32 @@ embed = ["model2vec>=0.3"]
 # Optional headless browser for webscrape's render mode (JS/SPA sites). Heavy (~Chromium):
 #   uv sync --group browser && uv run playwright install chromium
 browser = ["playwright>=1.40"]
+# Optional LOCAL speech-to-text for videoforge (transcribe / auto_captions / make_short captions).
+# faster-whisper = CTranslate2 wheels, no PyTorch; downloads a small model on first use. Free, no key.
+# Add it without disturbing other installed groups (like the codeindex `semantic` group):
+#   uv pip install faster-whisper      (or, to (re)install every group at once: uv sync --all-groups)
+# (videoforge's FFmpeg editing tools work without this; only transcription/captions need it.)
+video = ["faster-whisper>=1.0"]
+# macOS computer-use (deskpilot): synthetic mouse/keyboard + the Accessibility tree of any app via
+# PyObjC. macOS-only, free, no keys. Needs Accessibility + Screen Recording granted to the launching
+# app (see deskpilot.health()).  uv sync --group desktop
+desktop = [
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-ApplicationServices>=10.0",
+    "pyobjc-framework-Cocoa>=10.0",
+]
+# Realtime voice agent (voice server). Free/local: VAD-endpointed streaming STT + streaming neural TTS
+# (Kokoro) with barge-in. macOS `say` is the zero-dep Tier-0 fallback.  uv sync --group voice
+voice = [
+    "RealtimeSTT>=0.3",
+    "RealtimeTTS[kokoro]>=0.4",
+    "faster-whisper>=1.0",
+    "webrtcvad>=2.0",
+    "sounddevice>=0.4",
+]
+# Optional: clone YOUR voice for the agent (Coqui XTTS + Chatterbox). Heavier.  uv sync --group voice-clone
+voice-clone = [
+    "RealtimeTTS[coqui]>=0.4",
+    "chatterbox-tts",
+    "audioop-lts",
+]

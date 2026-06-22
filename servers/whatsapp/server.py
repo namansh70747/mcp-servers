@@ -45,6 +45,10 @@ WA = "web.whatsapp.com"
 INLINE_WAIT = max(2, get_env_int("WHATSAPP_INLINE_WAIT", 14) or 14)
 THROTTLE = max(0, get_env_int("WHATSAPP_THROTTLE_SECONDS", 3) or 3)
 WPP_TIMEOUT = max(5, get_env_int("WHATSAPP_WPP_TIMEOUT", 30) or 30)
+# Numbers typed without a country code assume this one (digits only). 91 = India.
+DEFAULT_CC = re.sub(r"\D", "", get_env("WHATSAPP_DEFAULT_CC", "91") or "91")
+# After sending, poll the message's real delivery ack up to this long (in-page) before reporting.
+SEND_ACK_WAIT_MS = max(2000, get_env_int("WHATSAPP_SEND_ACK_WAIT_MS", 8000) or 8000)
 FUZZY_THRESHOLD = float(get_env("WHATSAPP_FUZZY_THRESHOLD", "0.72") or 0.72)
 MAX_MEDIA = 16 * 1024 * 1024
 MAX_MSG = 60000
@@ -283,12 +287,13 @@ _FIND_CHAT = (
 
 
 def _msgs_js(ref_json: str, count: int) -> str:
-    """A SYNC expression returning {found, chat, msgs:[{id,from_me,type,body,t}]} for a chat ref."""
+    """A SYNC expression returning {found, chat, msgs:[{id,from_me,type,body,t,ack}]} for a chat ref."""
     return ("(function(){" + _FIND_CHAT + "var c=__findChat(" + ref_json + ");if(!c)return {found:false};"
             "var ms=(c.msgs&&c.msgs.getModelsArray)?c.msgs.getModelsArray():[];"
             "return {found:true,chat:(c.id&&c.id._serialized)||'',msgs:ms.slice(-" + str(int(count)) +
             ").map(function(m){return {id:(m.id&&m.id._serialized)||'',from_me:!!(m.id&&m.id.fromMe),"
-            "type:m.type,body:(m.body||m.caption||''),t:m.t||0};})};})()")
+            "type:m.type,body:(m.body||m.caption||''),t:m.t||0,"
+            "ack:(typeof m.ack==='number'?m.ack:null)};})};})()")
 
 
 def wpp_chat_messages(chat_ref: str, count: int = 30) -> tuple[bool, object]:
@@ -313,6 +318,12 @@ def chat_id_from_msg_id(msg_id: str) -> str:
     return parts[1] if len(parts) >= 2 and ("@" in parts[1]) else ""
 
 
+def _ack_status(ack: int) -> str:
+    """Map a WhatsApp message ack to a human status. -1 failed, 0 queued (local), 1 sent (server),
+    2 delivered (recipient device), 3 read."""
+    return {-1: "failed", 0: "queued", 1: "sent", 2: "delivered", 3: "read"}.get(int(ack), "queued")
+
+
 def is_stopword(text: str) -> bool:
     """True if a message is an autopilot stop signal (bye / ttyl / stop / …)."""
     t = (text or "").strip().lower().strip(".!?…। ")
@@ -320,27 +331,47 @@ def is_stopword(text: str) -> bool:
 
 
 def wpp_send_text(chat_id: str, text: str) -> tuple[bool, object]:
-    # WA >= 2.3000 keys chats by LID. Resolve @c.us → actual WID (may be @lid) before sending.
+    """Send text and CONFIRM real delivery. For a phone (@c.us) target, verify it's on WhatsApp via
+    queryExists and send to the canonical wid (no blind fallback). After sending, poll the message's
+    ack IN-PAGE (one relay round-trip) until it reaches the server (ack>=1), fails (-1), or the budget
+    (SEND_ACK_WAIT_MS) elapses. Returns (ok, {ok, id, ack}) | (ok, {ok:false, not_on_whatsapp:true})."""
     cid_js = j(chat_id)
     txt_js = j(text)
+    wait_ms = str(int(SEND_ACK_WAIT_MS))
     expr = (
-        "(function(){var cid=" + cid_js + ",txt=" + txt_js + ";"
-        "function doSend(wid){return window.WPP.chat.sendTextMessage(wid,txt,{createChat:true})"
-        ".then(function(r){return {sent:true,id:(r&&r.id)?String(r.id):''}});}"
-        "if(cid.indexOf('@c.us')>=0){"
-        "return window.WPP.contact.queryExists(cid.split('@')[0])"
-        ".then(function(r){var wid=(r&&r.wid&&r.wid._serialized)||(r&&r._serialized)||cid;"
-        "return doSend(wid);}).catch(function(){return doSend(cid);});}"
+        "(function(){var cid=" + cid_js + ",txt=" + txt_js + ",WAIT=" + wait_ms + ";var W=window.WPP;"
+        # Look up a sent Msg by id via the SYNC, live-updating MsgStore (server-fetch APIs hang on this
+        # build, so we never use getMessageById). Returns the Msg model or null.
+        "function getMsg(id){try{var S=W.whatsapp&&W.whatsapp.MsgStore;if(S){var m=(S.get&&S.get(id))||"
+        "(S.find&&S.find(id));return m||null;}}catch(e){}return null;}"
+        # Poll ack until server-confirmed (>=1), failed (-1), or deadline.
+        "function pollAck(id,deadline){var m=getMsg(id);var a=(m&&typeof m.ack==='number')?m.ack:0;"
+        "if(a>=1||a===-1||Date.now()>=deadline)return Promise.resolve({ack:a});"
+        "return new Promise(function(res){setTimeout(res,400);}).then(function(){return pollAck(id,deadline);});}"
+        "function doSend(wid){return W.chat.sendTextMessage(wid,txt,{createChat:true})"
+        ".then(function(r){var id=(r&&r.id)?String((r.id&&r.id._serialized)||r.id):'';"
+        "if(!id)return {ok:true,id:'',ack:0};"
+        "return pollAck(id,Date.now()+WAIT).then(function(p){return {ok:true,id:id,ack:p.ack};});});}"
+        # Phone target: confirm it's on WhatsApp, then send to the canonical wid. No unverified fallback.
+        "if(cid.indexOf('@c.us')>=0){return W.contact.queryExists(cid.split('@')[0]).then(function(r){"
+        "if(!r)return {ok:false,not_on_whatsapp:true};"
+        "var wid=(r&&r.wid&&r.wid._serialized)||(r&&r._serialized)||cid;return doSend(wid);});}"
         "return doSend(cid);})()"
     )
-    return wpp_raw(expr)
+    return wpp_raw(expr, timeout=max(WPP_TIMEOUT, SEND_ACK_WAIT_MS // 1000 + 6))
 
 
 # ============================================================ contact resolution
 def normalize_phone(query: str) -> str | None:
     c = (query or "").strip()
+    if not re.fullmatch(r"\+?[\d][\d\s\-()]{6,}", c):
+        return None
     digits = re.sub(r"[^\d]", "", c)
-    return digits if (re.fullmatch(r"\+?[\d][\d\s\-()]{6,}", c) and 7 <= len(digits) <= 15) else None
+    # Bare national number (no leading '+', exactly 10 digits, not already CC-prefixed) → assume
+    # DEFAULT_CC, so e.g. 7696074751 becomes 917696074751 (a routable @c.us). Guard double-prepend.
+    if not c.startswith("+") and DEFAULT_CC and len(digits) == 10 and not digits.startswith(DEFAULT_CC):
+        digits = DEFAULT_CC + digits
+    return digits if 7 <= len(digits) <= 15 else None
 
 
 def chat_id_for_number(digits: str) -> str:
@@ -601,12 +632,12 @@ def refresh_contacts() -> dict:
 
 @mcp.tool
 def check_on_whatsapp(number: str) -> dict:
-    """Check if a phone number (with country code) is on WhatsApp."""
+    """Check if a phone number is on WhatsApp. A bare number assumes WHATSAPP_DEFAULT_CC (default 91)."""
     if (e := _need_ready()):
         return e
     digits = normalize_phone(number)
     if not digits:
-        return err("give a phone number with country code, e.g. +14155551234")
+        return err("give a phone number, e.g. +14155551234 (or a 10-digit number for the default country)")
     okq, val = wpp_query_exists(digits)
     return ok(**val) if okq and isinstance(val, dict) else err(str(val))
 
@@ -688,7 +719,13 @@ def compose(contact: str, intent: str) -> dict:
 @mcp.tool
 def send(contact: str, message: str, exact: bool = False, dry_run: bool = False) -> dict:
     """Send by name/nickname/number. Ambiguous name → returns candidates (doesn't send); pick one and
-    re-call with exact=true (the pick is learned). For YOUR voice, compose() first. Background job."""
+    re-call with exact=true (the pick is learned). For YOUR voice, compose() first. Background job.
+
+    A number without a country code assumes WHATSAPP_DEFAULT_CC (default 91 / India). The recipient is
+    verified on WhatsApp before sending (a number that isn't on WhatsApp errors instead of faking
+    success). The result confirms real delivery: `ack` (0-3) + `status` (queued/sent/delivered/read);
+    `sent` is true only once WhatsApp's server acked it (ack>=1). status "queued" = accepted locally but
+    not yet server-confirmed."""
     if not (contact or "").strip():
         return err("contact is required")
     if not (message or "").strip():
@@ -706,17 +743,29 @@ def send(contact: str, message: str, exact: bool = False, dry_run: bool = False)
 
     def fn():
         okr, val = wpp_send_text(cid, message)
-        if okr:
-            mem_learn_alias(contact, cid, label=name, source="confirmed", confidence=0.97)
-            if THROTTLE:
-                time.sleep(THROTTLE)
-            res = val if isinstance(val, dict) else {"sent": True}
-            res.setdefault("sent", True)
-            # surface the resolved chat id (the @lid/@c.us the message actually landed in) so the caller
-            # can read / wait_for_reply on it reliably without re-resolving.
-            res["chat_id"] = chat_id_from_msg_id(res.get("id", "")) or cid
-            return okr, res
-        return okr, (val if isinstance(val, dict) else {"sent": True})
+        if not okr:
+            return False, str(val)
+        if not isinstance(val, dict):
+            return False, "unexpected send result"
+        if val.get("not_on_whatsapp"):
+            return False, f"{name or contact} is not on WhatsApp"
+        if not val.get("ok", True):
+            return False, str(val.get("error") or "send failed")
+        ack = int(val.get("ack", 0))
+        if ack == -1:
+            return False, "message failed to send (ack -1)"
+        # Confirmed enough to record the resolution (the message reached WPP's send pipeline).
+        mem_learn_alias(contact, cid, label=name, source="confirmed", confidence=0.97)
+        if THROTTLE:
+            time.sleep(THROTTLE)
+        msg_id = val.get("id", "")
+        # sent is TRUE only once the WhatsApp server acked it (ack>=1). ack 0 = still local → honest
+        # "queued". chat_id surfaces the @lid/@c.us it landed in for read / wait_for_reply.
+        res = {"sent": ack >= 1, "ack": ack, "status": _ack_status(ack), "id": msg_id,
+               "chat_id": chat_id_from_msg_id(msg_id) or cid}
+        if ack == 0:
+            res["note"] = "locally queued — not yet confirmed by the WhatsApp server"
+        return True, res
     return _act("send", fn, contact_name=name, contact_id=cid)
 
 
