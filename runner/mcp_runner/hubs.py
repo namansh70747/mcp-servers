@@ -82,7 +82,7 @@ HUBS: dict[str, dict] = {
     },
     "career": {
         "custom": ["resume-forge", "deckforge", "portfolio-site", "linkedin-optimizer",
-                   "blog-drafter", "interview-prep", "jobtrack", "learn-tracker"],
+                   "blog-drafter", "interview-prep", "jobtrack", "learn-tracker", "videoforge"],
         "ready": [],
     },
     "prod": {
@@ -91,8 +91,11 @@ HUBS: dict[str, dict] = {
         "ready": ["memory", "fetch", "duckduckgo"],
     },
     "system": {
-        "custom": ["mac-control", "homebrew", "spotify"],
-        "ready": ["applescript", "shortcuts", "messages", "apple-events", "apple-notes",
+        # Order matters: some clients (Qwen Desktop) truncate a hub's tool list at a cap, so the
+        # servers the user reaches for most — whatsapp/chrome/background messaging — MUST mount first
+        # or their tools fall off the end and look "unavailable". Heavy/rare servers go last.
+        "custom": ["whatsapp", "chrome", "background", "deskpilot", "mac-control", "homebrew", "spotify"],
+        "ready": ["messages", "applescript", "shortcuts", "apple-events", "apple-notes",
                   "screenshot", "spotlight", "playwright"],
     },
 }
