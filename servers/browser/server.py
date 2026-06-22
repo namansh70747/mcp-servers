@@ -23,8 +23,12 @@ from mcp_base import data_dir, err, make_server, ok, repo_root, scrape
 
 mcp = make_server(
     "browser",
-    instructions=("Stateful browser agent. open(url) starts a real Chromium (persistent profile -> "
-                  "stays logged in). Perceive: elements()/snapshot(). Act: goto/click/type/fill/"
+    instructions=("Stateful browser agent. open(url) starts a SEPARATE Chromium with its OWN profile "
+                  "(NOT your everyday Chrome) — so any site needs a one-time login here the first time. "
+                  "For WhatsApp use the `whatsapp` connector (drives your REAL Chrome where you're "
+                  "already logged in, no QR); for anything in your real Chrome use the `chrome` "
+                  "connector. This `browser` is for fresh/automated sessions. "
+                  "Perceive: elements()/snapshot(). Act: goto/click/type/fill/"
                   "fill_by_label/fill_form/press/select_option/submit/hover/double_click/drag/scroll. "
                   "Auth: login(url,user,password); signup_autofill() from profile.json. Get results: "
                   "get_text/content/extract/contacts/data/query/links/tables/capture(API JSON)/"
@@ -255,8 +259,9 @@ async def _do_accept_cookies() -> dict:
 # ---------- lifecycle ----------
 @mcp.tool
 async def open(url: str = "", headless: bool = False) -> dict:
-    """Start the browser (persistent profile -> stays logged in) and optionally navigate to url.
-    Visible by default so you can solve CAPTCHA / 2FA. Returns current url + title."""
+    """Start a SEPARATE Chromium with its OWN profile (NOT your everyday Chrome) and optionally
+    navigate to url. First visit to any site needs a fresh login HERE. For WhatsApp use the
+    `whatsapp` connector (your real Chrome, already logged in, no QR), NOT this. Returns url+title."""
     async with _lock:
         e = await _ensure(headless)
         if e:
