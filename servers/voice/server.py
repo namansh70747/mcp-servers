@@ -227,6 +227,16 @@ def _synthesize_to_file(text: str, language: str, engine: str,
         if not _coqui_ready():
             return False, "coqui/XTTS not installed (uv sync --group voice-clone)"
         try:
+            # Compat shim: newer transformers dropped isin_mps_friendly; XTTS still needs it.
+            import transformers.pytorch_utils as _tpu  # noqa: PLC0415
+            if not hasattr(_tpu, "isin_mps_friendly"):
+                import torch as _th  # noqa: PLC0415
+                _tpu.isin_mps_friendly = lambda elements, test_elements: _th.isin(elements, test_elements)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import os as _os  # noqa: PLC0415
+            _os.environ.setdefault("COQUI_TOS_AGREED", "1")  # auto-accept license (personal use)
             from TTS.api import TTS as CoquiTTS  # noqa: PLC0415
             tts = CoquiTTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
             tts.tts_to_file(text=text, speaker_wav=sample_path or None,
