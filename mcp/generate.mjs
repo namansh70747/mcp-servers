@@ -218,13 +218,24 @@ for (const client of CLIENTS) {
     // Qwen Desktop caps MCP entries (~5). Write the 5 aggregated hubs.
     // --refresh-package forces uvx to rebuild the local runner wheel from source on every launch
     // so edits to hubs.py take effect immediately without manual reinstall.
+    // Qwen Desktop spawns MCP servers with a MINIMAL environment, so we must set HOME (uvx cache),
+    // USER, and a full PATH (node/npx for ready-made servers, uv/uvx/git) explicitly — otherwise
+    // uvx can't build/run the hub and it silently exposes nothing.
+    const nodeDir = path.dirname(firstExisting([
+      path.join(HOME, ".local/bin/node"), "/opt/homebrew/bin/node", "/usr/local/bin/node",
+    ], "/opt/homebrew/bin/node"));
+    const QWEN_PATH = [
+      path.join(HOME, ".local/bin"), nodeDir, "/opt/homebrew/bin",
+      "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+    ].filter((p, i, a) => a.indexOf(p) === i).join(":");
+    const hubEnv = { HOME, USER: env.USER || os.userInfo().username, PATH: QWEN_PATH, MCP_SUITE_ROOT: ROOT };
     for (const hub of QWEN_HUBS) {
       const hubName = `${hub}-hub`;
       block[hubName] = {
         name: hubName,
         command: UVX,
         args: ["--refresh-package", "mcp-suite-runner", "--from", path.join(ROOT, "runner"), "run-mcp-hub", hub],
-        env: { MCP_SUITE_ROOT: ROOT },
+        env: hubEnv,
       };
       count++;
     }
