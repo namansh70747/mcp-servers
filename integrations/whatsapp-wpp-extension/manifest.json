@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsApp WPP Bridge (mcp-servers)",
+  "version": "1.2.0",
+  "description": "Injects WPPConnect wa-js into WhatsApp Web and boots it AFTER WhatsApp's modules register (fix for WA Web >= 2.3000 / wa-js#3419, where one-shot finders run too early). Talks to the local mcp-servers `whatsapp` connector across the isolated world via shared-DOM attributes. Local/personal use only.",
+  "content_scripts": [
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["wa-loader.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://web.whatsapp.com/*"],
+      "js": ["wpp-patch.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}
