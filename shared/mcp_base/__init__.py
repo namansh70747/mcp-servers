@@ -3,8 +3,9 @@
 Import surface kept tiny on purpose:
     from mcp_base import make_server, BaseStore, data_dir, db_path, get_env
 """
-from . import embed, fetch, http, scrape
+from . import chrome, embed, fetch, http, scrape, semantic
 from .app import make_server
+from .jobs import Jobs
 from .config import (
     base_data_dir,
     data_dir,
@@ -22,6 +23,7 @@ from .store import BaseStore
 
 __all__ = [
     "make_server",
+    "Jobs",
     "BaseStore",
     "base_data_dir",
     "data_dir",
@@ -42,4 +44,6 @@ __all__ = [
     "scrape",
     "fetch",
     "embed",
+    "semantic",
+    "chrome",
 ]

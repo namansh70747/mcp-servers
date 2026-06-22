@@ -14,7 +14,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, db_path, make_server
+from mcp_base import BaseStore, db_path, make_server, semantic
 
 mcp = make_server(
     "project-memory",
@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS checkpoints(
 
 KINDS = {"decision", "todo", "glossary", "convention", "context"}
 store = BaseStore(db_path("project-memory"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("pm_vec"))
+
+
+def _reindex(mid: int) -> None:
+    m = store.query_one("SELECT note,tags FROM memories WHERE id=?", (mid,))
+    if m:
+        semantic.index_row(store, "pm_vec", mid, f"{m.get('note') or ''} {m.get('tags') or ''}")
 
 # Defensive migration for stores created before these columns existed.
 for _alter in (
@@ -160,6 +167,7 @@ def remember(note: str, kind: str = "context", tags: str = "", project: str | No
         "VALUES(?,?,?,?,?,?,?)",
         (proj, kind, note, tags, max(0, min(5, importance)), 1 if pinned else 0, _now()),
     )
+    _reindex(mid)
     return {"id": mid, "project": proj, "kind": kind, "tags": tags,
             "importance": max(0, min(5, importance)), "pinned": pinned}
 
@@ -191,8 +199,19 @@ def recall(query: str, project: str | None = None, limit: int = 10, kind: str | 
             "ORDER BY created_at DESC LIMIT ?",
             (proj, like, like, max(limit * 3, 30)),
         )
-    if kind:
-        rows = [r for r in rows if r["kind"] == kind]
+    # semantic layer: cosine hits scoped to this project, merged into candidates + scored
+    vec = dict(semantic.vector_hits(store, "pm_vec", query,
+                                    where_sql="SELECT id FROM memories WHERE project=?",
+                                    params=(proj,), limit=max(limit * 3, 30)))
+    have = {r["id"] for r in rows}
+    missing = [mid for mid in vec if mid not in have]
+    if missing:
+        ph = ",".join("?" * len(missing))
+        rows += store.query(
+            f"SELECT id, kind, note, tags, importance, pinned, access_count, created_at "
+            f"FROM memories WHERE id IN ({ph})", tuple(missing))
+        if kind:
+            rows = [r for r in rows if r["kind"] == kind]
 
     now = datetime.now(timezone.utc)
     scored = []
@@ -205,7 +224,8 @@ def recall(query: str, project: str | None = None, limit: int = 10, kind: str | 
             age_days = 30
         recency = math.exp(-age_days / 45.0)
         pin = 0.5 if (boost_pinned and r.get("pinned")) else 0.0
-        r["score"] = round(rel + 0.6 * imp + 0.4 * recency + pin, 4)
+        sem = vec.get(r["id"], 0.0)  # cosine 0..1
+        r["score"] = round(rel + 0.6 * imp + 0.4 * recency + pin + 0.8 * sem, 4)
         scored.append(r)
     scored.sort(key=lambda x: x["score"], reverse=True)
     out = scored[:limit]
@@ -250,7 +270,23 @@ def update_memory(memory_id: int, note: str | None = None, kind: str | None = No
     new_tags = tags if tags is not None else row["tags"]
     store.execute("UPDATE memories SET note=?, kind=?, tags=?, updated_at=? WHERE id=?",
                   (new_note, new_kind, new_tags, _now(), memory_id))
+    _reindex(memory_id)
     return {"ok": True, "id": memory_id, "kind": new_kind}
+
+
+@mcp.tool
+def reindex_semantic(project: str | None = None) -> dict:
+    """(Re)build semantic embeddings for memories (optionally one project). Needs a local model
+    (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    if project:
+        rows = store.query("SELECT id FROM memories WHERE project=?", (_project(project),))
+    else:
+        rows = store.query("SELECT id FROM memories")
+    for r in rows:
+        _reindex(r["id"])
+    return {"ok": True, "indexed": len(rows)}
 
 
 @mcp.tool
@@ -369,6 +405,7 @@ def forget(memory_id: int) -> dict:
     """Delete a memory by id (also removes its graph edges)."""
     store.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     store.execute("DELETE FROM links WHERE a_id=? OR b_id=?", (memory_id, memory_id))
+    semantic.drop_row(store, "pm_vec", memory_id)
     return {"ok": True, "deleted": memory_id}
 
 
@@ -397,6 +434,7 @@ def forget_where(project: str | None = None, kind: str | None = None, tag: str |
     for mid in ids:
         store.execute("DELETE FROM memories WHERE id=?", (mid,))
         store.execute("DELETE FROM links WHERE a_id=? OR b_id=?", (mid, mid))
+        semantic.drop_row(store, "pm_vec", mid)
     return {"ok": True, "deleted": len(ids), "ids": ids[:50]}
 
 

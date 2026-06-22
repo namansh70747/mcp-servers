@@ -21,7 +21,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import date, datetime, timezone
 
-from mcp_base import base_data_dir, get_logger, make_server, not_found, ok
+from mcp_base import base_data_dir, err, get_logger, make_server, not_found, ok
 
 log = get_logger("daily-digest")
 
@@ -391,6 +391,109 @@ def _rank(items: list[dict]) -> list[dict]:
     return sorted(items, key=key)
 
 
+# ---------------- impact/effort/urgency prioritization ----------------
+# Relative "impact" weight per source: how consequential it is to act on an item
+# from this server *today*. Higher = more impactful. Outreach/jobtrack follow-ups
+# and overdue tasks tend to be time-sensitive and career-consequential; habit
+# check-ins and flashcard reviews are valuable but lower-stakes if slipped a day.
+_SOURCE_WEIGHT = {
+    "jobtrack": 5.0,        # a missed follow-up can cost an opportunity
+    "reachout": 4.5,        # outreach windows close fast
+    "task-manager": 4.0,    # explicit user-chosen commitments
+    "learn-tracker": 3.0,   # deadlines/reviews matter but are reschedulable
+    "interview-prep": 2.5,  # SRS reviews compound, low single-day cost
+    "habit-tracker": 2.0,   # streaks matter, but one slip is recoverable
+}
+_DEFAULT_SOURCE_WEIGHT = 3.0
+
+# Urgency multiplier from the item's classified bucket (overdue dominates).
+_URGENCY_WEIGHT = {
+    "overdue": 3.0,
+    "due_today": 2.0,
+    "due_soon": 1.3,
+    "due": 1.0,
+    "open": 0.7,
+}
+
+# A rough "effort" proxy per source (1 = quick, higher = heavier). We reward
+# low-effort wins slightly so quick high-impact items float up (impact/effort).
+_SOURCE_EFFORT = {
+    "habit-tracker": 1.0,    # a single check-in
+    "interview-prep": 1.0,   # one card review
+    "reachout": 1.5,         # send/personalize a follow-up
+    "jobtrack": 1.5,         # draft a follow-up note
+    "learn-tracker": 2.0,    # a study/review session
+    "task-manager": 2.0,     # arbitrary, treat as medium
+}
+_DEFAULT_EFFORT = 2.0
+
+
+def _overdue_days(due_val) -> float:
+    """How many days an item is past due (0 if not overdue / undated)."""
+    dt = _parse_dt(due_val)
+    if dt is None:
+        return 0.0
+    delta_days = (_now() - dt).total_seconds() / 86400.0
+    return delta_days if delta_days > 0 else 0.0
+
+
+def _days_until(due_val) -> float | None:
+    """Calendar days from today until the due date (negative if past). None if undated."""
+    dt = _parse_dt(due_val)
+    if dt is None:
+        return None
+    return float((dt.date() - _now().date()).days)
+
+
+def _priority_score(it: dict) -> float:
+    """Heuristic impact/effort/urgency score for one digest item (higher = do first).
+
+    score = (source_impact * urgency_multiplier * proximity_boost) / effort
+    plus an overdue accelerator so the longest-overdue items rise to the top.
+    Pure function over the item dict — never raises on malformed fields.
+    """
+    src = it.get("source", "")
+    urg = it.get("urgency", "open")
+    impact = _SOURCE_WEIGHT.get(src, _DEFAULT_SOURCE_WEIGHT)
+    urg_mult = _URGENCY_WEIGHT.get(urg, _URGENCY_WEIGHT["open"])
+    effort = _SOURCE_EFFORT.get(src, _DEFAULT_EFFORT) or _DEFAULT_EFFORT
+
+    # Proximity boost: the closer (or further past) a due date, the more pressing.
+    due = it.get("due")
+    days = _days_until(due)
+    if days is None:
+        proximity = 1.0  # undated / open items: neutral
+    elif days <= 0:
+        proximity = 1.0  # due today or past — overdue accelerator handles the past
+    else:
+        # within ~2 weeks ramps from ~1.5 down toward 1.0
+        proximity = 1.0 + max(0.0, (14.0 - min(days, 14.0)) / 28.0)
+
+    # Overdue accelerator: each overdue day adds urgency, capped so a single
+    # ancient item can't completely starve everything else.
+    overdue = _overdue_days(due)
+    overdue_boost = min(overdue, 30.0) * 0.15
+
+    base = (impact * urg_mult * proximity) / effort
+    return round(base + overdue_boost, 4)
+
+
+def _prioritize(items: list[dict]) -> list[dict]:
+    """Return items annotated with `score` and sorted by it (desc), stable on ties.
+
+    Ties break by the existing urgency/due ranking so output is deterministic.
+    """
+    ranked = _rank(items)  # deterministic baseline ordering
+    scored = []
+    for idx, it in enumerate(ranked):
+        out = dict(it)
+        out["score"] = _priority_score(it)
+        scored.append((idx, out))
+    # Sort by score desc; idx (the _rank order) breaks ties deterministically.
+    scored.sort(key=lambda pair: (-pair[1]["score"], pair[0]))
+    return [out for _, out in scored]
+
+
 # ---------------- tools ----------------
 @mcp.tool
 def today() -> dict:
@@ -474,6 +577,48 @@ def source(name: str, limit: int = 50) -> dict:
         total=len(items),
         returned=len(trimmed),
         items=trimmed,
+    )
+
+
+@mcp.tool
+def prioritize(limit: int = 15) -> dict:
+    """Rank today's cross-server items by an impact/effort/urgency heuristic.
+
+    Unlike whats_due()/today() (which sort by urgency then due-date order), this
+    scores each item by source impact, urgency, due-date proximity and how far it
+    is overdue, divided by a rough per-source effort proxy — so the most
+    consequential, time-sensitive, quick-to-act items surface first.
+
+    Read-only across every source DB; missing DBs/tables contribute nothing and
+    never error. Returns items annotated with a numeric `score` (higher = do first)
+    plus a short `weights` legend describing the heuristic.
+    """
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        return err("limit must be an integer", hint="e.g. prioritize(limit=15)")
+    n = max(1, min(n, 500))
+
+    items = _prioritize(_gather())
+    trimmed = items[:n]
+    counts: dict[str, int] = {}
+    for it in trimmed:
+        counts[it["source"]] = counts.get(it["source"], 0) + 1
+    return ok(
+        date=_today_str(),
+        total=len(items),
+        returned=len(trimmed),
+        items=trimmed,
+        counts=counts,
+        weights={
+            "source_impact": _SOURCE_WEIGHT,
+            "urgency_multiplier": _URGENCY_WEIGHT,
+            "source_effort": _SOURCE_EFFORT,
+            "note": (
+                "score = source_impact * urgency_multiplier * due_proximity / effort "
+                "+ overdue_accelerator; higher score = act first"
+            ),
+        },
     )
 
 

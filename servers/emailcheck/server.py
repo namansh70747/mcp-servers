@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import re
 
-from mcp_base import make_server
+from mcp_base import err, make_server
 
 mcp = make_server(
     "emailcheck",
     instructions=("Vet outreach before sending: validate_email / check_mx (can the domain receive?), "
-                  "spam_score (heuristic content review), extract_emails (pull addresses from text), "
-                  "domain_report (MX+SPF+DMARC). DNS tools need network; the rest are offline."),
+                  "spam_score (heuristic content review), phishing_score (is THIS message/URL a phish?), "
+                  "extract_emails (pull addresses from text), domain_report (MX+SPF+DMARC). "
+                  "DNS tools need network; the rest are offline."),
 )
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
@@ -26,6 +27,46 @@ _SPAM_PHRASES = (
     "credit card", "investment", "lowest price", "no cost", "this isn't spam",
     "dear friend", "increase sales", "double your", "best price",
 )
+
+# Brands commonly impersonated in phishing; used for look-alike (typosquat) detection.
+_PHISH_BRANDS = (
+    "paypal", "apple", "microsoft", "office365", "outlook", "google", "gmail",
+    "amazon", "netflix", "facebook", "instagram", "linkedin", "dropbox", "docusign",
+    "wellsfargo", "chase", "bankofamerica", "citibank", "hsbc", "barclays", "coinbase",
+    "binance", "metamask", "icloud", "adobe", "dhl", "fedex", "ups", "usps", "irs",
+    "whatsapp", "steam", "github", "stripe",
+)
+
+# Urgency / pressure language typical of phishing lures.
+_PHISH_URGENCY = (
+    "urgent", "immediately", "right away", "as soon as possible", "act now",
+    "action required", "verify your account", "verify now", "confirm your account",
+    "confirm your identity", "update your payment", "update your billing",
+    "suspended", "your account has been", "unusual activity", "unauthorized",
+    "limited time", "expires", "expire", "within 24 hours", "within 48 hours",
+    "final notice", "failure to", "avoid suspension", "click the link below",
+    "log in to", "login to", "reset your password", "secure your account",
+    "validate your", "account will be closed", "we detected", "security alert",
+)
+
+# Free / disposable / risky hosting often used for credential-harvest pages.
+_PHISH_RISKY_TLDS = (
+    ".zip", ".mov", ".xyz", ".top", ".tk", ".ml", ".ga", ".cf", ".gq", ".click",
+    ".link", ".country", ".kim", ".work", ".support", ".rest",
+)
+_PHISH_SHORTENERS = (
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd", "buff.ly",
+    "rebrand.ly", "cutt.ly", "rb.gy", "shorturl.at", "tiny.cc",
+)
+_PHISH_SENSITIVE_HOST_WORDS = (
+    "secure", "account", "login", "signin", "verify", "update", "billing",
+    "support", "webscr", "confirm", "wallet", "auth", "recovery", "unlock",
+)
+
+_URL_RE = re.compile(r"https?://[^\s<>\"')]+", re.I)
+_ANCHOR_RE = re.compile(r'<a\b[^>]*?href=["\']?(https?://[^"\'>\s]+)["\']?[^>]*>(.*?)</a>', re.I | re.S)
+_IPV4_HOST_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 # ---------- offline helpers ----------
@@ -146,6 +187,248 @@ def spam_score(subject: str, body: str) -> dict:
         suggestions.append("Add a clear opt-out link.")
     return {"score": score, "risk": verdict, "reasons": reasons, "suggestions": suggestions,
             "caps_ratio": round(caps_ratio, 3), "link_count": len(links)}
+
+
+# ---------- phishing (offline) ----------
+def _host_of(url: str) -> str:
+    """Extract a lowercased hostname from a URL without raising. No network."""
+    try:
+        from urllib.parse import urlsplit
+        h = (urlsplit(url).hostname or "").lower()
+        return h
+    except Exception:
+        # crude fallback: strip scheme, userinfo, path, port
+        s = re.sub(r"^[a-z]+://", "", (url or "").strip(), flags=re.I)
+        s = s.split("/", 1)[0].split("?", 1)[0]
+        if "@" in s:
+            s = s.rsplit("@", 1)[1]
+        return s.rsplit(":", 1)[0].lower()
+
+
+def _registrable(host: str) -> str:
+    """Best-effort eTLD+1 (no PSL dependency): last two labels, or three for common
+    two-level public suffixes. Good enough for look-alike heuristics. No network."""
+    parts = [p for p in (host or "").split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    two_level = {"co", "com", "org", "net", "gov", "edu", "ac"}
+    if parts[-2] in two_level and len(parts[-1]) == 2:  # e.g. co.uk, com.au, com.br
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance (iterative, O(len(a)*len(b))). Pure offline."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _homoglyph_norm(s: str) -> str:
+    """Fold common look-alike character swaps so 'paypa1' -> 'paypal', 'micros0ft' -> 'microsoft'."""
+    return (s.replace("0", "o").replace("1", "l").replace("5", "s")
+            .replace("3", "e").replace("$", "s").replace("|", "l")
+            .replace("rn", "m"))  # 'paypaI'->kept; 'rn'->'m' classic spoof
+
+
+def _lookalike_brand(host: str) -> tuple[str, str] | None:
+    """If a hostname's registrable part resembles (but isn't) a known brand, return
+    (brand, label). Catches typosquats (paypa1, micros0ft, app1e), homoglyphs, and
+    brand-plus-decoy hosts (paypal-secure, apple-id-verify). No network. Never matches a
+    host that is *actually* on the brand's own registrable domain."""
+    host = (host or "").lower()
+    reg = _registrable(host)
+    if not reg:
+        return None
+    base = reg.rsplit(".", 1)[0]  # the registrable label, e.g. 'paypal-secure' from 'paypal-secure.com'
+    # tokens within the base, splitting on hyphen/underscore (paypal-secure -> paypal, secure)
+    tokens = [t for t in re.split(r"[-_]", base) if t]
+    for brand in _PHISH_BRANDS:
+        # a token EXACTLY equal to the brand but the registrable domain is NOT the brand's own
+        # (e.g. 'paypal' token inside 'paypal-secure.com'; legit 'paypal.com' is excluded)
+        if brand in tokens and base != brand:
+            return brand, base
+        for tok in tokens:
+            nt = _homoglyph_norm(tok)
+            if nt == brand and tok != brand:
+                return brand, base
+            if len(brand) >= 5 and 0 < _edit_distance(nt, brand) <= 1:
+                return brand, base
+        # homoglyph fold of the whole base equals the brand (paypa1secure won't, but paypa1 will)
+        nb = _homoglyph_norm(base.replace("-", "").replace("_", ""))
+        if nb == brand and base != brand:
+            return brand, base
+        if len(brand) >= 5 and 0 < _edit_distance(_homoglyph_norm(base), brand) <= 1:
+            return brand, base
+    return None
+
+
+def _has_punycode(host: str) -> bool:
+    return any(lbl.startswith("xn--") for lbl in (host or "").split("."))
+
+
+def _strip_tags(s: str) -> str:
+    return _TAG_RE.sub(" ", s or "")
+
+
+@mcp.tool
+def phishing_score(text_or_url: str) -> dict:
+    """Heuristic phishing-likelihood for a raw URL, an email body, or pasted HTML.
+    Fully OFFLINE (no DNS, no fetch) and never raises. Flags look-alike / typosquatted
+    brand domains, punycode (xn--) hosts, raw IP-literal links, URL shorteners, risky TLDs,
+    credential-bait host words, urgency/pressure language, and mismatched anchor link text
+    (display host != href host). Returns a 0-1 risk score, a 0-100 percentage, a verdict,
+    itemized reasons, and the URLs inspected."""
+    try:
+        text = text_or_url if isinstance(text_or_url, str) else ("" if text_or_url is None else str(text_or_url))
+        text = text.strip()
+        if not text:
+            return err("empty input", risk_score=0.0, risk_pct=0, verdict="low",
+                       reasons=[], urls=[], hint="pass a URL, email body, or HTML")
+
+        reasons: list[str] = []
+        weight = 0  # accumulates; mapped to 0-1 at the end
+
+        low = text.lower()
+        is_bare_url = bool(_URL_RE.fullmatch(text))
+
+        # --- collect URLs (bare + within text) ---
+        urls = _URL_RE.findall(text)
+        # de-dup, preserve order
+        seen_u, uniq_urls = set(), []
+        for u in urls:
+            u = u.rstrip(".,);]'\"")
+            if u not in seen_u:
+                seen_u.add(u)
+                uniq_urls.append(u)
+
+        # --- anchor link-text vs href mismatch (HTML) ---
+        for href, inner in _ANCHOR_RE.findall(text):
+            disp_text = _strip_tags(inner).strip()
+            disp_urls = _URL_RE.findall(disp_text)
+            href_host = _registrable(_host_of(href))
+            if disp_urls:  # the visible label is itself a URL → compare hosts
+                disp_host = _registrable(_host_of(disp_urls[0]))
+                if disp_host and href_host and disp_host != href_host:
+                    weight += 35
+                    reasons.append(f"link text shows '{disp_host}' but href points to '{href_host}'")
+            elif href_host:
+                # visible text names a brand the href host doesn't belong to
+                dl = disp_text.lower()
+                for brand in _PHISH_BRANDS:
+                    if brand in dl and brand not in href_host:
+                        weight += 25
+                        reasons.append(f"link labeled '{brand}' actually points to '{href_host}'")
+                        break
+
+        # --- per-URL host analysis ---
+        flagged_hosts = set()
+        for u in uniq_urls:
+            host = _host_of(u)
+            if not host or host in flagged_hosts:
+                continue
+            flagged_hosts.add(host)
+
+            if _IPV4_HOST_RE.match(host):
+                weight += 30
+                reasons.append(f"link uses a raw IP address ({host}) instead of a domain")
+                continue
+
+            if _has_punycode(host):
+                weight += 30
+                reasons.append(f"punycode/IDN host (possible homoglyph spoof): {host}")
+
+            la = _lookalike_brand(host)
+            if la:
+                brand, label = la
+                weight += 35
+                reasons.append(f"look-alike domain '{label}' impersonating '{brand}'")
+
+            reg = _registrable(host)
+            if reg in _PHISH_SHORTENERS:
+                weight += 12
+                reasons.append(f"URL shortener hides the real destination ({reg})")
+
+            for t in _PHISH_RISKY_TLDS:
+                if host.endswith(t):
+                    weight += 10
+                    reasons.append(f"risky/abused TLD ({t}) on {host}")
+                    break
+
+            # credential-bait words living in a subdomain or hyphenated host — but skip
+            # legit brand auth domains (e.g. accounts.google.com, login.microsoftonline.com)
+            reg_base = reg.rsplit(".", 1)[0] if reg else ""
+            on_known_brand = reg_base in _PHISH_BRANDS
+            if not on_known_brand:
+                sub = host[: -len(reg)] if reg and host.endswith(reg) else host
+                hit_words = sorted({w for w in _PHISH_SENSITIVE_HOST_WORDS if w in sub})
+                if hit_words:
+                    weight += min(12, 4 * len(hit_words))
+                    reasons.append(f"credential-bait words in host: {', '.join(hit_words)}")
+
+            # excessive subdomain nesting (e.g. login.account.secure.example.evil.com)
+            if host.count(".") >= 4:
+                weight += 8
+                reasons.append(f"deeply nested subdomains ({host.count('.') + 1} labels): {host}")
+
+            # '@' embedded in URL is a classic redirect/obfuscation trick
+            if re.search(r"https?://[^/\s]*@", u, re.I):
+                weight += 20
+                reasons.append("'@' in URL authority can mask the true destination")
+
+        # --- urgency / pressure language (skip if it's just a bare URL) ---
+        if not is_bare_url:
+            urg = sorted({p for p in _PHISH_URGENCY if p in low})
+            if urg:
+                weight += min(30, 7 * len(urg))
+                reasons.append(f"urgency/pressure language: {', '.join(urg[:6])}")
+
+            # generic salutation + credential ask is a strong combo
+            if re.search(r"\b(dear (customer|user|member|client)|valued customer)\b", low):
+                weight += 8
+                reasons.append("generic salutation (no real name)")
+
+            if re.search(r"\b(password|ssn|social security|credit card|cvv|pin|one-time|otp|seed phrase|bank account)\b", low):
+                weight += 15
+                reasons.append("requests sensitive credentials/payment info")
+
+        # plain text that mentions a brand but links elsewhere
+        if uniq_urls and not is_bare_url:
+            link_regs = {_registrable(_host_of(u)) for u in uniq_urls}
+            for brand in _PHISH_BRANDS:
+                if brand in low and not any(brand in r for r in link_regs):
+                    weight += 10
+                    reasons.append(f"mentions '{brand}' but no link goes to a '{brand}' domain")
+                    break
+
+        if not reasons:
+            reasons.append("no phishing indicators found")
+
+        score = round(min(1.0, weight / 100.0), 3)
+        pct = int(round(score * 100))
+        verdict = "low" if score < 0.25 else "medium" if score < 0.55 else "high"
+        return {
+            "ok": True,
+            "risk_score": score,
+            "risk_pct": pct,
+            "verdict": verdict,
+            "reasons": reasons,
+            "urls": uniq_urls,
+            "note": "offline heuristic — not a verdict; verify the real sender/domain before trusting.",
+        }
+    except Exception as e:  # universal no-crash guard
+        return err(f"{type(e).__name__}: {e}", risk_score=0.0, risk_pct=0,
+                   verdict="low", reasons=[], urls=[])
 
 
 # ---------- DNS (network) ----------

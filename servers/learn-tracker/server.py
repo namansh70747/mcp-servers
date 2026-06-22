@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from mcp_base import BaseStore, db_path, err, make_server, not_found
+from mcp_base import (BaseStore, db_path, err, fetch as _hfetch, make_server, not_found, scrape,
+                      semantic)
 
 mcp = make_server(
     "learn-tracker",
@@ -30,6 +31,14 @@ CREATE TABLE IF NOT EXISTS resources(
 );
 """
 store = BaseStore(db_path("learn-tracker"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("course_vec"))
+
+
+def _reindex_course(cid: int) -> None:
+    c = store.query_one("SELECT title,provider,notes,tags FROM courses WHERE id=?", (cid,))
+    if c:
+        txt = " ".join(str(c.get(k) or "") for k in ("title", "provider", "tags", "notes"))
+        semantic.index_row(store, "course_vec", cid, txt)
 
 
 def _now():
@@ -74,25 +83,11 @@ _MAX_FETCH_BYTES = 2_000_000  # cap downloaded page size (~2MB) to bound memory
 
 
 def _fetch_title(url: str) -> str:
-    url = (url or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
+    """Fetch a page <title> via the hardened shared fetch (SSRF-guarded, retry, encoding). '' on failure."""
+    r = _hfetch.fetch(url, timeout=10, max_bytes=_MAX_FETCH_BYTES)
+    if not r.get("ok") or r.get("not_modified"):
         return ""
-    try:
-        import httpx
-        from bs4 import BeautifulSoup
-        with httpx.stream("GET", url, timeout=10, follow_redirects=True,
-                          headers={"User-Agent": "Mozilla/5.0"}) as r:
-            chunks, total = [], 0
-            for chunk in r.iter_bytes():
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= _MAX_FETCH_BYTES:
-                    break
-            html = b"".join(chunks).decode(r.encoding or "utf-8", errors="ignore")
-        soup = BeautifulSoup(html, "html.parser")
-        return (soup.title.string or "").strip()[:200] if soup.title else ""
-    except Exception:
-        return ""
+    return scrape.title(r.get("html", ""))[:200]
 
 
 # ---------------- Courses ----------------
@@ -106,7 +101,41 @@ def add_course(title: str, provider: str = "", url: str = "", hours: int = 0, st
     cid = store.execute(
         "INSERT INTO courses(title,provider,url,hours,status,deadline,tags,updated_at,created_at) "
         "VALUES(?,?,?,?,?,?,?,?,?)", (title, provider, url, max(0, hours), status, deadline, tags, _now(), _now()))
+    _reindex_course(cid)
     return {"id": cid, "title": title}
+
+
+@mcp.tool
+def search(query: str, limit: int = 10) -> list[dict]:
+    """Find courses by MEANING (semantic) fused with keyword match — e.g. 'distributed systems' finds
+    relevant courses even if titled differently. Keyword-only fallback when no embedding model is present."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    kw = [r["id"] for r in store.query(
+        "SELECT id FROM courses WHERE title LIKE ? OR provider LIKE ? OR notes LIKE ? OR tags LIKE ? LIMIT 50",
+        (like, like, like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "course_vec", q, limit=50)]
+    ids = semantic.rrf(kw, vec, max(1, limit)) if vec else kw[:max(1, limit)]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,title,provider,status,progress_pct,tags FROM courses WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all courses. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM courses"):
+        _reindex_course(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool

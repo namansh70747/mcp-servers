@@ -12,7 +12,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, db_path, err, make_server, not_found
+from mcp_base import BaseStore, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "snippet-vault",
@@ -37,6 +37,14 @@ CREATE TRIGGER IF NOT EXISTS snip_au AFTER UPDATE ON snippets BEGIN
 END;
 """
 store = BaseStore(db_path("snippet-vault"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("snippets_vec"))
+
+
+def _reindex(sid: int) -> None:
+    s = store.query_one("SELECT title,lang,tags,code,description FROM snippets WHERE id=?", (sid,))
+    if s:
+        txt = " ".join(str(s.get(k) or "") for k in ("title", "lang", "tags", "description", "code"))
+        semantic.index_row(store, "snippets_vec", sid, txt)
 
 
 def _ensure_columns(table: str, cols: dict[str, str]) -> None:
@@ -130,6 +138,7 @@ def _save_snippet(title: str, code: str, lang: str = "", tags: str = "", descrip
         "INSERT INTO snippets(title,lang,code,tags,description,created_at,updated_at,usage_count) "
         "VALUES(?,?,?,?,?,?,?,0)",
         (title, lang, code, tags, description, _now(), _now()))
+    _reindex(sid)
     return {"id": sid, "title": title, "lang": lang}
 
 
@@ -143,15 +152,40 @@ def save_snippet(title: str, code: str, lang: str = "", tags: str = "", descript
 
 @mcp.tool
 def search(query: str, limit: int = 15) -> list[dict]:
-    """Full-text search across title/code/tags."""
+    """Hybrid search across title/code/tags: keyword (FTS) fused with semantic vector similarity
+    (so 'retry with backoff' finds a relevant snippet even without those exact words). Keyword-only
+    fallback when no embedding model is installed."""
+    q = (query or "").strip()
+    if not q:
+        return []
     try:
-        return store.query(
-            "SELECT s.id,s.title,s.lang,s.tags,s.usage_count FROM snippets_fts f JOIN snippets s ON s.id=f.rowid "
-            "WHERE snippets_fts MATCH ? ORDER BY rank LIMIT ?", (query, limit))
+        fts = [r["id"] for r in store.query(
+            "SELECT s.id FROM snippets_fts f JOIN snippets s ON s.id=f.rowid "
+            "WHERE snippets_fts MATCH ? ORDER BY rank LIMIT 50", (q,))]
     except Exception:
-        like = f"%{query}%"
-        return store.query("SELECT id,title,lang,tags,usage_count FROM snippets WHERE title LIKE ? OR code LIKE ? LIMIT ?",
-                           (like, like, limit))
+        like = f"%{q}%"
+        fts = [r["id"] for r in store.query(
+            "SELECT id FROM snippets WHERE title LIKE ? OR code LIKE ? LIMIT 50", (like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "snippets_vec", q, limit=50)]
+    ids = semantic.rrf(fts, vec, max(1, limit)) if vec else fts[:max(1, limit)]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,title,lang,tags,usage_count FROM snippets WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all snippets. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM snippets"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool
@@ -179,6 +213,7 @@ def list_by_lang(lang: str = "", limit: int = 50) -> list[dict]:
 def delete(snippet_id: int) -> dict:
     """Delete a snippet."""
     store.execute("DELETE FROM snippets WHERE id=?", (snippet_id,))
+    semantic.drop_row(store, "snippets_vec", snippet_id)
     return {"ok": True, "deleted": snippet_id}
 
 
@@ -205,6 +240,7 @@ def update_snippet(snippet_id: int, title: str = "", code: str = "", lang: str =
     store.execute(
         "UPDATE snippets SET title=?,code=?,lang=?,tags=?,description=?,updated_at=? WHERE id=?",
         (new["title"], new["code"], new["lang"], new["tags"], new["description"], _now(), snippet_id))
+    _reindex(snippet_id)
     return {"ok": True, "id": snippet_id, **new}
 
 

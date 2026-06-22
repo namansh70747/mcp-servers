@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS signals(
   published_at TEXT, found_at TEXT,
   UNIQUE(company, url)
 );
+CREATE TABLE IF NOT EXISTS watches(
+  company TEXT PRIMARY KEY, every_days INTEGER DEFAULT 1, last_scan TEXT DEFAULT '', created_at TEXT
+);
 """
 store = BaseStore(db_path("news-radar"), schema=SCHEMA)
 
@@ -183,6 +186,85 @@ def signal_types() -> dict:
     """List the signal categories this server detects (offline; no network)."""
     return {"signals": list(SIGNAL_KEYWORDS.keys()) + ["news"],
             "sources": ["all", "google_news", "hackernews"]}
+
+
+@mcp.tool
+def watch_company(name: str, every_days: int = 1) -> dict:
+    """Add a company to the watch list so due_watches() re-scans it on a cadence (default daily)."""
+    name = (name or "").strip()
+    if not name:
+        return {"error": "name is required"}
+    every_days = max(1, min(int(every_days) if str(every_days).isdigit() else 1, 90))
+    store.execute("INSERT INTO watches(company,every_days,last_scan,created_at) VALUES(?,?,?,?) "
+                  "ON CONFLICT(company) DO UPDATE SET every_days=excluded.every_days",
+                  (name, every_days, "", _now()))
+    return {"ok": True, "watching": name, "every_days": every_days}
+
+
+@mcp.tool
+def list_watches() -> list[dict]:
+    """List watched companies + their cadence and last scan time."""
+    return store.query("SELECT company,every_days,last_scan,created_at FROM watches ORDER BY company")
+
+
+@mcp.tool
+def unwatch_company(name: str) -> dict:
+    """Stop watching a company."""
+    store.execute("DELETE FROM watches WHERE company=?", ((name or "").strip(),))
+    return {"ok": True, "unwatched": (name or "").strip()}
+
+
+@mcp.tool
+def due_watches(limit: int = 10) -> dict:
+    """Re-scan every watched company whose cadence is due; returns per-company new-signal counts."""
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    due = []
+    for w in store.query("SELECT company,every_days,last_scan FROM watches"):
+        last = w["last_scan"] or ""
+        try:
+            overdue = (not last) or (now - _dt.fromisoformat(last)).days >= w["every_days"]
+        except Exception:
+            overdue = True
+        if overdue:
+            due.append(w["company"])
+    due = due[:_clamp_limit(limit, 10)]
+    results = []
+    for company in due:
+        r = scan_company(company, since_days=14, limit=15)
+        store.execute("UPDATE watches SET last_scan=? WHERE company=?", (_now(), company))
+        results.append({"company": company, "new": r.get("stored_or_seen", 0),
+                        "by_signal": r.get("by_signal", {})})
+    return {"scanned": len(results), "results": results}
+
+
+@mcp.tool
+def trends(company: str = "", buckets: int = 6, bucket_days: int = 30) -> dict:
+    """Signal counts over time for a company (or all): `buckets` windows of `bucket_days` each, plus a
+    by-type breakdown — surfaces whether activity (hiring/funding/launches) is accelerating."""
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    now = _dt.now(_tz.utc)
+    buckets = max(1, min(int(buckets) if str(buckets).isdigit() else 6, 24))
+    bucket_days = max(1, min(int(bucket_days) if str(bucket_days).isdigit() else 30, 365))
+    where = "WHERE 1=1" + (" AND lower(company)=?" if company else "")
+    params = [company.lower()] if company else []
+    rows = store.query(f"SELECT signal,found_at FROM signals {where}", params)
+    series = [0] * buckets
+    by_type: dict[str, int] = {}
+    for r in rows:
+        try:
+            age = (now - _dt.fromisoformat(r["found_at"])).days
+        except Exception:
+            continue
+        idx = age // bucket_days
+        if 0 <= idx < buckets:
+            series[idx] += 1
+            by_type[r["signal"]] = by_type.get(r["signal"], 0) + 1
+    # series[0] = most recent window
+    trend = "rising" if len(series) > 1 and series[0] > series[1] else (
+        "flat" if sum(series) else "no data")
+    return {"company": company or "all", "bucket_days": bucket_days, "windows_recent_first": series,
+            "by_signal": by_type, "trend": trend, "total": sum(series)}
 
 
 @mcp.tool

@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, time, timedelta, timezone
 
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "task-manager",
@@ -50,6 +50,20 @@ _ensure_cols("tasks", {
     "importance": "INTEGER DEFAULT 0",
     "completed_at": "TEXT",
 })
+
+# Sidecar vector table for hybrid semantic search over task text.
+store.migrate(semantic.vec_table_sql("task_vec"))
+
+_TEXT_COLS = ("title", "notes", "project", "tags")
+
+
+def _reindex(rid: int) -> None:
+    """(Re)embed a task's searchable text. No-op when no model is installed; never raises."""
+    r = store.query_one(
+        "SELECT title,notes,project,tags FROM tasks WHERE id=?", (rid,))
+    if r:
+        semantic.index_row(store, "task_vec", rid,
+                           " ".join(str(r.get(k) or "") for k in _TEXT_COLS))
 
 
 # ---------------- Natural-language due parsing (stdlib only) ----------------
@@ -151,10 +165,12 @@ def _create_task(title: str, priority: str, due: str, notes: str, *, parent_id=N
     if priority not in PRIOS:
         priority = "med"
     due_iso = _parse_due(due) if due else ""
-    return store.execute(
+    tid = store.execute(
         "INSERT INTO tasks(title,priority,due,notes,parent_id,project,tags,recurrence,importance,created_at) "
         "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (title, priority, due_iso or "", notes, parent_id, project, tags, recurrence, 1 if importance else 0, _now()))
+    _reindex(tid)
+    return tid
 
 
 @mcp.tool
@@ -236,6 +252,7 @@ def complete(task_id: int) -> dict:
         return not_found("task", task_id, available=_recent_task_ids(), hint="use list_tasks()")
     store.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=? OR (parent_id=? AND status='open')",
                   (_now(), task_id, task_id))
+    _reindex(task_id)  # status change keeps the vector fresh (text unchanged, but cheap + idempotent)
     result = {"ok": True, "id": task_id}
     if t["recurrence"]:
         nxt = _next_due(t["due"], t["recurrence"])
@@ -245,6 +262,7 @@ def complete(task_id: int) -> dict:
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (t["title"], t["priority"], nxt, t["notes"], t["project"], t["tags"],
                  t["recurrence"], t["importance"], _now()))
+            _reindex(nid)
             result["next_occurrence"] = {"id": nid, "due": nxt}
     return result
 
@@ -283,6 +301,7 @@ def update_task(task_id: int, title: str = "", priority: str = "", due: str = ""
         return {"error": "nothing to update"}
     params.append(task_id)
     store.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", params)
+    _reindex(task_id)
     return {"ok": True, "id": task_id}
 
 
@@ -303,7 +322,10 @@ def delete_task(task_id: int) -> dict:
     """Delete a task and its subtasks."""
     if not store.query_one("SELECT id FROM tasks WHERE id=?", (task_id,)):
         return not_found("task", task_id, available=_recent_task_ids(), hint="use list_tasks()")
+    doomed = store.query("SELECT id FROM tasks WHERE id=? OR parent_id=?", (task_id, task_id))
     store.execute("DELETE FROM tasks WHERE id=? OR parent_id=?", (task_id, task_id))
+    for r in doomed:
+        semantic.drop_row(store, "task_vec", r["id"])
     return {"ok": True, "id": task_id}
 
 
@@ -495,22 +517,81 @@ def move_to_project(task_id: int, project: str) -> dict:
     """Move a task (and its subtasks) into a project."""
     if not store.query_one("SELECT id FROM tasks WHERE id=?", (task_id,)):
         return not_found("task", task_id, available=_recent_task_ids(), hint="use list_tasks()")
+    moved = store.query("SELECT id FROM tasks WHERE id=? OR parent_id=?", (task_id, task_id))
     store.execute("UPDATE tasks SET project=? WHERE id=? OR parent_id=?", (project, task_id, task_id))
+    for r in moved:
+        _reindex(r["id"])
     return {"ok": True, "id": task_id, "project": project}
+
+
+def _hydrate_tasks(ids: list[int], status: str = "") -> list[dict]:
+    """Fetch task rows for `ids`, preserving the given order, optionally scoped to a status."""
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    sql = f"SELECT id,title,priority,due,status,project,tags FROM tasks WHERE id IN ({ph})"
+    params: list = list(ids)
+    if status:
+        sql += " AND status=?"; params.append(status)
+    rows = {r["id"]: r for r in store.query(sql, params)}
+    return [rows[i] for i in ids if i in rows]
 
 
 @mcp.tool
 def search_tasks(query: str, status: str = "", limit: int = 50) -> list[dict]:
-    """Search tasks by substring in title or notes. Empty status = any status."""
+    """Hybrid search across title/notes/project/tags: keyword (substring) fused with semantic vector
+    similarity, so 'fix the deploy pipeline' can surface a task titled 'CI release flow' even without
+    shared words. Keyword-only fallback when no embedding model is installed. Empty status = any status."""
     q = (query or "").strip()
     if not q:
         return []
-    sql = "SELECT id,title,priority,due,status,project FROM tasks WHERE (title LIKE ? OR notes LIKE ?)"
-    params: list = [f"%{q}%", f"%{q}%"]
-    if status:
-        sql += " AND status=?"; params.append(status)
-    sql += " ORDER BY status, due LIMIT ?"; params.append(max(1, limit))
-    return store.query(sql, params)
+    lim = max(1, limit)
+    like = f"%{q}%"
+    fts_ids = [r["id"] for r in store.query(
+        "SELECT id FROM tasks WHERE (title LIKE ? OR notes LIKE ? OR project LIKE ? OR tags LIKE ?) "
+        "ORDER BY status, CASE WHEN due='' THEN 1 ELSE 0 END, due LIMIT 50",
+        (like, like, like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "task_vec", q, limit=50)]
+    ids = semantic.rrf(fts_ids, vec, lim) if vec else fts_ids[:lim]
+    return _hydrate_tasks(ids, status)
+
+
+@mcp.tool
+def find_related(task_id: int, limit: int = 10) -> list[dict]:
+    """Find tasks semantically similar to a given task (by its title/notes/project/tags), excluding
+    itself. Uses the embedding model when available; otherwise falls back to keyword overlap on the
+    task's title. Returns [] for an unknown id."""
+    src = store.query_one("SELECT title,notes,project,tags FROM tasks WHERE id=?", (task_id,))
+    if not src:
+        return []
+    seed = " ".join(str(src.get(k) or "") for k in _TEXT_COLS).strip()
+    if not seed:
+        return []
+    vec = [rid for rid, _ in semantic.vector_hits(store, "task_vec", seed, limit=max(1, limit) + 1)
+           if rid != task_id]
+    if vec:
+        return _hydrate_tasks(vec[:max(1, limit)])
+    # Keyword fallback: match on the title text.
+    title = (src.get("title") or "").strip()
+    if not title:
+        return []
+    like = f"%{title}%"
+    fb = [r["id"] for r in store.query(
+        "SELECT id FROM tasks WHERE id!=? AND (title LIKE ? OR notes LIKE ?) LIMIT ?",
+        (task_id, like, like, max(1, limit)))]
+    return _hydrate_tasks(fb)
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for every task. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM tasks"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool

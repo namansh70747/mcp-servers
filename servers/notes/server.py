@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "notes",
@@ -57,6 +57,13 @@ def _ensure_cols(table: str, cols: dict[str, str]) -> None:
 
 
 _ensure_cols("notes", {"tags": "TEXT DEFAULT ''"})
+store.migrate(semantic.vec_table_sql("notes_vec"))
+
+
+def _reindex(nid: int, title: str, body: str) -> None:
+    """Keep the semantic vector for a note in sync (no-op without an embedding model)."""
+    if nid:
+        semantic.index_row(store, "notes_vec", nid, f"{title}\n{body}")
 
 
 def _tags(body: str, extra: str = "") -> str:
@@ -70,10 +77,14 @@ def _tags(body: str, extra: str = "") -> str:
 
 # ---------------- Core (preserved + deepened) ----------------
 def _upsert(title: str, body: str, tags_extra: str = "") -> int:
-    return store.execute(
+    store.execute(
         "INSERT INTO notes(title,body,tags,updated_at,created_at) VALUES(?,?,?,?,?) "
         "ON CONFLICT(title) DO UPDATE SET body=excluded.body, tags=excluded.tags, updated_at=excluded.updated_at",
         (title, body, _tags(body, tags_extra), _now(), _now()))
+    row = store.query_one("SELECT id FROM notes WHERE title=?", (title,))
+    nid = row["id"] if row else 0
+    _reindex(nid, title, body)
+    return nid
 
 
 @mcp.tool
@@ -97,6 +108,7 @@ def edit_note(title: str, body: str) -> dict:
         store.execute("UPDATE notes SET body=?, tags=?, updated_at=? WHERE title=?",
                       (body, _tags(body), _now(), title))
         nid = existing["id"]
+        _reindex(nid, title, body)
     return {"ok": True, "id": nid, "title": title, "links": LINK_RE.findall(body)}
 
 
@@ -120,15 +132,63 @@ def get(title: str) -> dict:
     return n
 
 
+def _fts_ids(query: str, n: int) -> list[int]:
+    try:
+        return [r["id"] for r in store.query(
+            "SELECT n.id FROM notes_fts f JOIN notes n ON n.id=f.rowid "
+            "WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?", (query, n))]
+    except Exception:
+        like = f"%{query}%"
+        return [r["id"] for r in store.query(
+            "SELECT id FROM notes WHERE title LIKE ? OR body LIKE ? LIMIT ?", (like, like, n))]
+
+
+def _hydrate(ids: list[int]) -> list[dict]:
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,title FROM notes WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
 @mcp.tool
 def search(query: str, limit: int = 15) -> list[dict]:
-    """Full-text search notes."""
-    try:
-        return store.query("SELECT n.id,n.title FROM notes_fts f JOIN notes n ON n.id=f.rowid "
-                           "WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?", (query, max(1, limit)))
-    except Exception:
-        return store.query("SELECT id,title FROM notes WHERE title LIKE ? OR body LIKE ? LIMIT ?",
-                           (f"%{query}%", f"%{query}%", max(1, limit)))
+    """Hybrid search: keyword (FTS) fused with semantic vector similarity (reciprocal-rank fusion).
+    Falls back to keyword-only when no embedding model is installed."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit = max(1, limit)
+    fts = _fts_ids(q, 50)
+    vec = [rid for rid, _ in semantic.vector_hits(store, "notes_vec", q, limit=50)]
+    ids = semantic.rrf(fts, vec, limit) if vec else fts[:limit]
+    return _hydrate(ids)
+
+
+@mcp.tool
+def related(title: str, limit: int = 8) -> list[dict]:
+    """Find notes semantically related to a given note (by meaning, not just shared words)."""
+    n = store.query_one("SELECT id,title,body FROM notes WHERE title=?", (title,))
+    if not n:
+        return [_no_note(title)]
+    hits = semantic.vector_hits(store, "notes_vec", f"{n['title']}\n{n['body']}", limit=limit + 1)
+    ids = [rid for rid, _ in hits if rid != n["id"]][:max(1, limit)]
+    return _hydrate(ids)
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all notes so search/related use vector ranking. Needs a local
+    model (uv sync --group embed); reports unavailable otherwise."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable",
+                "hint": "uv sync --group embed (model2vec, free, ~30MB) then call again"}
+    n = 0
+    for r in store.query("SELECT id,title,body FROM notes"):
+        if semantic.index_row(store, "notes_vec", r["id"], f"{r['title']}\n{r['body']}"):
+            n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool
@@ -164,9 +224,11 @@ def rename_note(old_title: str, new_title: str, update_links: bool = True) -> di
 @mcp.tool
 def delete_note(title: str) -> dict:
     """Delete a note by title."""
-    if not store.query_one("SELECT id FROM notes WHERE title=?", (title,)):
+    row = store.query_one("SELECT id FROM notes WHERE title=?", (title,))
+    if not row:
         return _no_note(title)
     store.execute("DELETE FROM notes WHERE title=?", (title,))
+    semantic.drop_row(store, "notes_vec", row["id"])
     return {"ok": True, "title": title}
 
 

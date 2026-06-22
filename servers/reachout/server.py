@@ -19,7 +19,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from jinja2 import Template
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "reachout",
@@ -84,6 +84,7 @@ def _ensure_columns() -> None:
         "thread_id": "TEXT", "scheduled_for": "TEXT", "snooze_until": "TEXT",
         "sequence_id": "INTEGER", "step": "INTEGER DEFAULT 0", "variant": "TEXT DEFAULT ''",
         "opened_at": "TEXT", "replied_at": "TEXT", "contact_id": "INTEGER",
+        "body": "TEXT DEFAULT ''",
     }
     for col, decl in wanted.items():
         if col not in have:
@@ -91,6 +92,29 @@ def _ensure_columns() -> None:
 
 
 _ensure_columns()
+
+# Semantic hybrid search over outreach history (subject/body/notes/company/recipient).
+# Sidecar vector table; index on log/create/send, drop on delete. Degrades to keyword-only
+# (LIKE) when no embedding model is installed.
+store.migrate(semantic.vec_table_sql("reachout_vec"))
+
+# Text columns that form the searchable corpus for one outreach row.
+_VEC_COLS = ("subject", "body", "notes", "company", "recipient_name", "role", "recipient_email")
+
+
+def _reindex(oid) -> None:
+    """Keep the semantic vector for an outreach row in sync (no-op without an embedding model)."""
+    try:
+        if not oid:
+            return
+        r = store.query_one(
+            "SELECT subject, body, notes, company, recipient_name, role, recipient_email "
+            "FROM outreach WHERE id=?", (oid,))
+        if r:
+            text = " ".join(str(r.get(k) or "") for k in _VEC_COLS).strip()
+            semantic.index_row(store, "reachout_vec", oid, text)
+    except Exception:  # noqa: BLE001 — indexing must never break a send/log path
+        pass
 
 
 def _profile() -> dict:
@@ -289,14 +313,15 @@ def create_draft(to_email: str, subject: str, body: str, recipient_name: str = "
     except Exception as e:  # noqa: BLE001 — transient Gmail/API error
         return err(f"{type(e).__name__}: {e}", code="gmail_error")
     oid = store.execute(
-        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,"
+        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,body,"
         "gmail_message_id,thread_id,status,variant,sequence_id,step,contact_id,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (recipient_name, to_email, company, role, template_used, subject,
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (recipient_name, to_email, company, role, template_used, subject, body,
          draft["message"]["id"], draft["message"].get("threadId", ""), "drafted",
          variant, sequence_id, step, contact_id, _now()),
     )
     _log_event(oid, "drafted", template_used)
+    _reindex(oid)
     return {"draft_id": draft["id"], "gmail_message_id": draft["message"]["id"], "outreach_id": oid}
 
 
@@ -330,13 +355,14 @@ def send_email(to_email: str, subject: str, body: str, recipient_name: str = "",
     except Exception as e:  # noqa: BLE001 — transient Gmail/API error
         return err(f"{type(e).__name__}: {e}", code="gmail_error")
     oid = store.execute(
-        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,"
+        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,body,"
         "gmail_message_id,thread_id,status,sent_at,variant,contact_id,created_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (recipient_name, to_email, company, role, template_used, subject, sent["id"],
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (recipient_name, to_email, company, role, template_used, subject, body, sent["id"],
          sent.get("threadId", ""), "sent", _now(), variant, contact_id, _now()),
     )
     _log_event(oid, "sent", template_used)
+    _reindex(oid)
     return {"gmail_message_id": sent["id"], "outreach_id": oid, "status": "sent"}
 
 
@@ -392,6 +418,7 @@ def log_outreach(recipient_name: str, recipient_email: str, company: str, role: 
          _now() if status == "sent" else None, notes, contact_id, _now()),
     )
     _log_event(oid, status, template_used)
+    _reindex(oid)
     return {"outreach_id": oid}
 
 
@@ -416,6 +443,56 @@ def list_outreach(status: str = "", company: str = "", limit: int = 50) -> list[
         sql += " AND company LIKE ?"; params.append(f"%{company}%")
     sql += " ORDER BY created_at DESC LIMIT ?"; params.append(limit)
     return store.query(sql, params)
+
+
+def _history_like_ids(q: str, n: int) -> list[int]:
+    """Keyword fallback over the outreach corpus (subject/body/notes/company/recipient/role/email)."""
+    like = f"%{q}%"
+    return [r["id"] for r in store.query(
+        "SELECT id FROM outreach WHERE status!='deleted' AND ("
+        "subject LIKE ? OR body LIKE ? OR notes LIKE ? OR company LIKE ? "
+        "OR recipient_name LIKE ? OR role LIKE ? OR recipient_email LIKE ?) "
+        "ORDER BY created_at DESC LIMIT ?",
+        (like, like, like, like, like, like, like, n))]
+
+
+@mcp.tool
+def search_history(query: str, limit: int = 15) -> list[dict]:
+    """Search past outreach by MEANING: hybrid keyword (LIKE over subject/body/notes/company/recipient)
+    fused with semantic vector similarity via reciprocal-rank fusion. Falls back to keyword-only when no
+    embedding model is installed. Returns matching outreach rows, best-first (never raises on empty)."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit = max(1, limit)
+    kw = _history_like_ids(q, 50)
+    vec = [rid for rid, _ in semantic.vector_hits(store, "reachout_vec", q, limit=50)]
+    ids = semantic.rrf(kw, vec, limit) if vec else kw[:limit]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        "SELECT id,recipient_name,recipient_email,company,role,status,subject,template_used,"
+        "sent_at,followup_count,variant,sequence_id,step,notes,created_at "
+        f"FROM outreach WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all outreach history so search_history uses vector ranking.
+    Needs a local embedding model (uv sync --group embed); reports unavailable otherwise."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable",
+                "hint": "uv sync --group embed (model2vec, free, ~30MB) then call again"}
+    n = 0
+    for r in store.query(
+            "SELECT id, subject, body, notes, company, recipient_name, role, recipient_email "
+            "FROM outreach WHERE status!='deleted'"):
+        text = " ".join(str(r.get(k) or "") for k in _VEC_COLS).strip()
+        if semantic.index_row(store, "reachout_vec", r["id"], text):
+            n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool
@@ -471,6 +548,7 @@ def mark_status(outreach_id: int, status: str, notes: str = "") -> dict:
     store.execute("UPDATE outreach SET status=?, notes=COALESCE(NULLIF(?,''),notes) WHERE id=?",
                   (status, notes, outreach_id))
     _log_event(outreach_id, status, notes[:200])
+    _reindex(outreach_id)
     return {"ok": True, "id": outreach_id, "status": status}
 
 
@@ -725,14 +803,15 @@ def thread_followup(outreach_id: int, template_name: str, variables: dict | None
     except Exception as e:  # noqa: BLE001 — transient Gmail/API error
         return err(f"{type(e).__name__}: {e}", code="gmail_error")
     new_id = store.execute(
-        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,"
-        "gmail_message_id,thread_id,status,sequence_id,step,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,subject,body,"
+        "gmail_message_id,thread_id,status,sequence_id,step,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row.get("recipient_name", ""), row["recipient_email"], row.get("company", ""),
-         row.get("role", ""), template_name, subject, draft["message"]["id"],
+         row.get("role", ""), template_name, subject, rendered.get("body", ""), draft["message"]["id"],
          row.get("thread_id") or draft["message"].get("threadId", ""), "drafted",
          row.get("sequence_id"), (row.get("step") or 0) + 1, _now()))
     record_followup(outreach_id)
     _log_event(new_id, "drafted", "thread_followup")
+    _reindex(new_id)
     return {"draft_id": draft["id"], "outreach_id": new_id, "subject": subject}
 
 

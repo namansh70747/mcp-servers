@@ -9,12 +9,13 @@ import subprocess
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 
-from mcp_base import make_server
+from mcp_base import err, make_server, ok
 
 mcp = make_server(
     "devlog",
     instructions=("Summarize git activity: daily_log, weekly_summary, standup(repo), authors, "
-                  "activity, streak, file_churn, multi_summary, export_markdown, contributors."),
+                  "activity, streak, file_churn, multi_summary, export_markdown, contributors, "
+                  "commit_impact, velocity."),
 )
 
 
@@ -90,6 +91,52 @@ def _numstat(repo: str, since: str, author: str = "") -> list[dict]:
                 files.append((add, rem, cols[2]))
         records.append({"author": an, "date": ad, "files": files})
     return records
+
+
+def _numstat_per_commit(repo: str, since: str, author: str = "") -> list[dict]:
+    """Per-commit numstat with hash + subject (newest first). Used by commit_impact."""
+    fmt = "%x1e%h%x1f%an%x1f%ad%x1f%s"
+    args = ["log", f"--since={since}", "--numstat", f"--pretty={fmt}", "--date=short"]
+    if author:
+        args.append(f"--author={author}")
+    out = _git(repo, *args)
+    if out.startswith("__error__"):
+        return []
+    records = []
+    for block in out.split("\x1e"):
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        head = lines[0].split("\x1f")
+        if len(head) < 4:
+            continue
+        sha, an, ad, subj = head[0], head[1], head[2], head[3]
+        files, added, removed, binary = [], 0, 0, 0
+        for ln in lines[1:]:
+            cols = ln.split("\t")
+            if len(cols) != 3:
+                continue
+            a_raw, r_raw, path = cols[0], cols[1], cols[2]
+            if a_raw == "-" or r_raw == "-":  # binary file: git emits "-\t-\tpath"
+                binary += 1
+                files.append({"file": path, "added": 0, "removed": 0, "binary": True})
+                continue
+            add = int(a_raw) if a_raw.isdigit() else 0
+            rem = int(r_raw) if r_raw.isdigit() else 0
+            added += add
+            removed += rem
+            files.append({"file": path, "added": add, "removed": rem, "binary": False})
+        records.append({"hash": sha, "author": an, "date": ad, "subject": subj,
+                        "files": files, "files_changed": len(files),
+                        "added": added, "removed": removed, "binary_files": binary})
+    return records
+
+
+def _iso_week(d: date) -> str:
+    """ISO year-week label like '2026-W25' for grouping commits by week."""
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
 
 
 @mcp.tool
@@ -252,6 +299,122 @@ def export_markdown(repo: str, days: int = 7, author: str = "") -> dict:
         lines += [f"- {s}" for s in by_day[day]]
         lines.append("")
     return {"repo": repo, "count": len(commits), "markdown": "\n".join(lines)}
+
+
+@mcp.tool
+def commit_impact(repo: str, since: str = "30 days ago", author: str = "",
+                  large_files: int = 10, large_churn: int = 300, top: int = 100) -> dict:
+    """Per-commit blast radius: files changed + churn (added+removed) per commit, with
+    large/risky commits flagged. A commit is flagged when it touches >= `large_files`
+    files OR has churn >= `large_churn` lines. Returns commits newest-first.
+
+    `since` accepts any git date spec ('30 days ago', '2.weeks.ago', '2026-01-01').
+    Never raises: returns err(...) for a non-repo path or bad inputs."""
+    if not isinstance(repo, str) or not repo.strip():
+        return err("repo is required", hint="pass a path to a git repository")
+    repo = repo.strip()
+    if not _is_repo(repo):
+        return err(f"not a git repo: {repo}", code="not_a_repo",
+                   hint="pass a path containing a .git directory")
+    since = (since or "30 days ago").strip() or "30 days ago"
+    try:
+        large_files = max(1, int(large_files))
+        large_churn = max(1, int(large_churn))
+        top = max(1, int(top))
+    except (TypeError, ValueError):
+        large_files, large_churn, top = 10, 300, 100
+
+    records = _numstat_per_commit(repo, since, (author or "").strip())
+    commits, total_added, total_removed, flagged = [], 0, 0, 0
+    for rec in records:
+        churn = rec["added"] + rec["removed"]
+        risky = rec["files_changed"] >= large_files or churn >= large_churn
+        reasons = []
+        if rec["files_changed"] >= large_files:
+            reasons.append(f">={large_files} files ({rec['files_changed']})")
+        if churn >= large_churn:
+            reasons.append(f">={large_churn} churn ({churn})")
+        total_added += rec["added"]
+        total_removed += rec["removed"]
+        if risky:
+            flagged += 1
+        commits.append({
+            "hash": rec["hash"], "author": rec["author"], "date": rec["date"],
+            "subject": rec["subject"], "files_changed": rec["files_changed"],
+            "added": rec["added"], "removed": rec["removed"], "churn": churn,
+            "binary_files": rec["binary_files"], "risky": risky,
+            "risk_reasons": reasons, "files": rec["files"],
+        })
+    commits = commits[:top]
+    n = len(records)
+    summary = {
+        "commits": n,
+        "files_changed": sum(r["files_changed"] for r in records),
+        "added": total_added, "removed": total_removed,
+        "churn": total_added + total_removed,
+        "flagged": flagged,
+        "avg_churn": round((total_added + total_removed) / n, 1) if n else 0,
+    }
+    return ok(repo=repo, since=since, author=(author or "").strip() or None,
+              thresholds={"large_files": large_files, "large_churn": large_churn},
+              summary=summary, commits=commits,
+              note="Review 'risky' commits first — large blast radius is harder to revert.")
+
+
+@mcp.tool
+def velocity(repo: str, since: str = "12 weeks ago", author: str = "") -> dict:
+    """Commits-per-week trend over a window. Returns one bucket per ISO week (oldest->newest)
+    with commit count and churn, plus a simple trend (rising/steady/falling) comparing the
+    most-recent half to the earlier half. Never raises: err(...) on a non-repo path."""
+    if not isinstance(repo, str) or not repo.strip():
+        return err("repo is required", hint="pass a path to a git repository")
+    repo = repo.strip()
+    if not _is_repo(repo):
+        return err(f"not a git repo: {repo}", code="not_a_repo",
+                   hint="pass a path containing a .git directory")
+    since = (since or "12 weeks ago").strip() or "12 weeks ago"
+
+    records = _numstat_per_commit(repo, since, (author or "").strip())
+    buckets: dict[str, dict] = {}
+    for rec in records:
+        try:
+            d = datetime.strptime(rec["date"], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        wk = _iso_week(d)
+        b = buckets.setdefault(wk, {"week": wk, "commits": 0, "added": 0, "removed": 0})
+        b["commits"] += 1
+        b["added"] += rec["added"]
+        b["removed"] += rec["removed"]
+    for b in buckets.values():
+        b["churn"] = b["added"] + b["removed"]
+    weeks = [buckets[k] for k in sorted(buckets)]  # oldest -> newest
+
+    counts = [w["commits"] for w in weeks]
+    total = sum(counts)
+    n_weeks = len(weeks)
+    avg = round(total / n_weeks, 2) if n_weeks else 0
+    peak = max(weeks, key=lambda w: w["commits"]) if weeks else None
+    trend = "no-data"
+    if n_weeks >= 2:
+        mid = n_weeks // 2
+        first = sum(counts[:mid]) / max(1, mid)
+        second = sum(counts[mid:]) / max(1, n_weeks - mid)
+        if second > first * 1.15:
+            trend = "rising"
+        elif second < first * 0.85:
+            trend = "falling"
+        else:
+            trend = "steady"
+    elif n_weeks == 1:
+        trend = "steady"
+
+    return ok(repo=repo, since=since, author=(author or "").strip() or None,
+              weeks=weeks, total_commits=total, active_weeks=n_weeks,
+              avg_commits_per_week=avg,
+              peak_week={"week": peak["week"], "commits": peak["commits"]} if peak else None,
+              trend=trend,
+              note="trend compares the most-recent half of the window to the earlier half.")
 
 
 if __name__ == "__main__":

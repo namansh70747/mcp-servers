@@ -317,6 +317,105 @@ _FAMILY = {"python-uv": "python", "fastapi": "python", "cli": "python", "mcp-ser
            "node-ts": "node", "react-vite": "node", "static-web": "node", "go": "go", "rust": "rust"}
 
 
+# Keyword profile per stack for recommend_stack(). Each entry maps a stack to
+# (one-line blurb, {keyword: weight}). Keywords are matched case-insensitively as
+# whole words against the description; multi-word phrases match as substrings.
+_STACK_PROFILES: dict[str, tuple[str, dict[str, float]]] = {
+    "python-uv": ("General-purpose Python library/app managed with uv.", {
+        "python": 3, "py": 2, "library": 2, "package": 2, "module": 2, "script": 2,
+        "uv": 3, "data": 1.5, "ml": 1.5, "machine learning": 2, "pandas": 2,
+        "numpy": 2, "automation": 1.5, "backend": 1, "pip": 1.5}),
+    "node-ts": ("TypeScript Node.js library/service (tsc build).", {
+        "typescript": 3, "ts": 2, "node": 3, "nodejs": 3, "javascript": 2, "js": 1.5,
+        "npm": 2, "library": 2, "package": 2, "backend": 1.5, "server": 1, "tsc": 2}),
+    "static-web": ("Plain static website (HTML/CSS/JS), deploy to Pages.", {
+        "static": 3, "website": 2.5, "site": 2, "html": 3, "css": 2.5, "landing": 2.5,
+        "landing page": 3, "portfolio": 2, "pages": 1.5, "github pages": 2.5,
+        "blog": 1.5, "vanilla": 2, "no framework": 2.5}),
+    "fastapi": ("Python FastAPI REST API service (uvicorn).", {
+        "fastapi": 4, "api": 3, "rest": 2.5, "rest api": 3, "endpoint": 2, "backend": 2,
+        "server": 1.5, "uvicorn": 3, "microservice": 2.5, "service": 1.5, "http": 1.5,
+        "json api": 2.5, "web service": 2.5, "python": 1.5}),
+    "react-vite": ("React single-page app bundled with Vite.", {
+        "react": 4, "vite": 3, "spa": 2.5, "frontend": 2.5, "front-end": 2.5, "ui": 2,
+        "single page": 2.5, "single-page": 2.5, "component": 2, "jsx": 2.5,
+        "dashboard": 2, "web app": 2.5, "webapp": 2.5, "javascript": 1.5}),
+    "go": ("Go module/binary (single main package).", {
+        "go": 4, "golang": 4, "binary": 1.5, "cli": 1, "service": 1, "server": 1,
+        "concurrent": 1.5, "microservice": 1.5, "daemon": 1.5}),
+    "rust": ("Rust crate/binary (Cargo).", {
+        "rust": 4, "cargo": 3, "crate": 3, "systems": 2, "performance": 1.5,
+        "binary": 1.5, "cli": 1, "wasm": 1.5, "embedded": 1.5}),
+    "cli": ("Python command-line tool (argparse, installable script).", {
+        "cli": 4, "command line": 3.5, "command-line": 3.5, "terminal": 2.5,
+        "tool": 2, "argparse": 2.5, "console": 2, "script": 1.5, "utility": 2,
+        "argument": 1.5, "python": 1}),
+    "mcp-server": ("FastMCP (stdio) server exposing tools to agents.", {
+        "mcp": 4, "fastmcp": 4, "tool": 1.5, "agent": 2.5, "llm": 2, "claude": 2,
+        "model context protocol": 4, "stdio": 2, "ai": 1.5, "assistant": 1.5}),
+}
+
+# Precompiled, escaped word/phrase matchers keyed by (stack, keyword).
+_re = __import__("re")
+_KEYWORD_RES: dict[str, list[tuple[str, float, "_re.Pattern"]]] = {}
+for _stack, (_blurb, _kws) in _STACK_PROFILES.items():
+    _entries = []
+    for _kw, _w in _kws.items():
+        if " " in _kw or "-" in _kw:
+            _pat = _re.compile(_re.escape(_kw), _re.IGNORECASE)
+        else:
+            _pat = _re.compile(r"\b" + _re.escape(_kw) + r"\b", _re.IGNORECASE)
+        _entries.append((_kw, float(_w), _pat))
+    _KEYWORD_RES[_stack] = _entries
+
+
+@mcp.tool
+def recommend_stack(description: str, limit: int = 3) -> dict:
+    """Suggest the best-matching built-in stack template(s) for a free-text project
+    description, via keyword scoring over the template catalog. Read-only.
+
+    Returns {ok, query, recommendations:[{stack, score, blurb, matched, files}]}.
+    Falls back to a hint (no error) when the description is empty or nothing matches."""
+    try:
+        q = (description or "").strip()
+        if not q:
+            return {"ok": True, "query": "", "recommendations": [],
+                    "hint": "describe your project (e.g. 'a REST API in Python', "
+                            "'a React dashboard', 'a CLI tool')"}
+        try:
+            n = int(limit)
+        except (TypeError, ValueError):
+            n = 3
+        n = max(1, min(n, len(_STACK_PROFILES)))
+
+        scored = []
+        for stack, entries in _KEYWORD_RES.items():
+            blurb = _STACK_PROFILES[stack][0]
+            score = 0.0
+            matched = []
+            for kw, weight, pat in entries:
+                hits = len(pat.findall(q))
+                if hits:
+                    score += weight * hits
+                    matched.append(kw)
+            if score > 0:
+                scored.append({"stack": stack, "score": round(score, 2),
+                               "blurb": blurb, "matched": matched,
+                               "files": sorted(TEMPLATES.get(stack, {}))})
+        # Highest score first; tie-break by more distinct keywords, then name.
+        scored.sort(key=lambda r: (-r["score"], -len(r["matched"]), r["stack"]))
+
+        recs = scored[:n]
+        out = {"ok": True, "query": q, "recommendations": recs}
+        if not recs:
+            out["hint"] = ("no stack keywords matched; see list_templates() for the "
+                           "full catalog or try terms like 'api', 'cli', 'react', 'go'")
+        return out
+    except Exception as e:  # noqa: BLE001 — tools must never raise
+        return {"ok": False, "error": f"recommend_stack failed: {e}",
+                "recommendations": []}
+
+
 @mcp.tool
 def list_templates() -> dict:
     """List available stacks and the files each generates."""

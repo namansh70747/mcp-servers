@@ -203,5 +203,148 @@ def delete_habit(habit: str) -> dict:
     return {"ok": True, "habit": h["name"]}
 
 
+@mcp.tool
+def correlations(days: int = 90, min_overlap: int = 3) -> dict:
+    """Which habits tend to be done on the same days. Read-only.
+
+    Looks at the last N days of check-ins and reports, for each pair of habits,
+    how often they were both done on the same day (Jaccard overlap). Useful for
+    spotting habit-stacking opportunities. Never raises.
+    """
+    try:
+        days = max(1, int(days))
+    except (TypeError, ValueError):
+        days = 90
+    try:
+        min_overlap = max(1, int(min_overlap))
+    except (TypeError, ValueError):
+        min_overlap = 3
+    cutoff = _today() - timedelta(days=days)
+    habits = store.query("SELECT id,name,cadence,status FROM habits ORDER BY name")
+    # day-sets within window, per habit
+    sets = {}
+    for h in habits:
+        ds = {d for d in _checkin_days(h["id"]) if d >= cutoff}
+        if ds:
+            sets[h["id"]] = ds
+    by_id = {h["id"]: h for h in habits}
+    pairs = []
+    ids = sorted(sets)
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            sa, sb = sets[a], sets[b]
+            both = sa & sb
+            union = sa | sb
+            if len(both) < min_overlap:
+                continue
+            jaccard = round(len(both) / len(union), 3) if union else 0.0
+            pairs.append({
+                "habit_a": by_id[a]["name"], "habit_b": by_id[b]["name"],
+                "both_days": len(both), "a_days": len(sa), "b_days": len(sb),
+                "jaccard": jaccard,
+                "lift": round(len(both) / min(len(sa), len(sb)), 3) if min(len(sa), len(sb)) else 0.0,
+            })
+    pairs.sort(key=lambda p: (p["jaccard"], p["both_days"]), reverse=True)
+    return {"ok": True, "days": days, "min_overlap": min_overlap,
+            "habits_considered": len(sets), "pairs": pairs}
+
+
+def _cadence_misses(habit_id: int, cadence: str, window_days: int) -> dict:
+    """Within the last `window_days`, count completed vs missed periods.
+
+    For weekly habits a "period" is a week, so the window is converted to weeks.
+    """
+    days = _checkin_days(habit_id)
+    today = _today()
+    if cadence == "weekly":
+        periods = max(1, window_days // 7)
+        weeks_done = {d.isocalendar()[:2] for d in days}
+        ref = today
+        hit = miss = 0
+        for _ in range(periods):
+            if ref.isocalendar()[:2] in weeks_done:
+                hit += 1
+            else:
+                miss += 1
+            ref -= timedelta(weeks=1)
+    else:
+        periods = max(1, window_days)
+        hit = miss = 0
+        ref = today
+        for _ in range(periods):
+            if ref in days:
+                hit += 1
+            else:
+                miss += 1
+            ref -= timedelta(days=1)
+    return {"hit": hit, "miss": miss, "periods": periods, "unit": "week" if cadence == "weekly" else "day",
+            "rate": round(hit / periods, 3) if periods else 0.0}
+
+
+@mcp.tool
+def recommend(habit: str = "", window: int = 30) -> dict:
+    """Suggest a habit cadence based on streak/miss patterns. Read-only.
+
+    For one habit (by name/id) or all active habits when `habit` is empty,
+    inspects recent completion rate, current streak, and best streak to advise
+    keeping, easing (daily -> weekly), or tightening (weekly -> daily) the cadence.
+    Purely advisory; changes nothing. Never raises.
+    """
+    try:
+        window = max(7, int(window))
+    except (TypeError, ValueError):
+        window = 30
+
+    def _advise(h: dict) -> dict:
+        cad = h["cadence"]
+        cur = _streak(h["id"], cad)
+        best = _best_streak(h["id"])
+        m = _cadence_misses(h["id"], cad, window)
+        rate = m["rate"]
+        total = len(_checkin_days(h["id"]))
+        suggestion, reason = cad, ""
+        if total == 0:
+            suggestion, reason = cad, "no check-ins yet — start small and build consistency"
+        elif cad == "daily":
+            if rate >= 0.85:
+                suggestion, reason = "daily", f"strong daily adherence ({int(rate*100)}%) — keep it daily"
+            elif rate >= 0.4:
+                suggestion = "daily"
+                reason = (f"moderate adherence ({int(rate*100)}%) — keep daily but lower the bar; "
+                          "aim for a minimum viable version on busy days")
+            else:
+                suggestion = "weekly"
+                reason = (f"low daily adherence ({int(rate*100)}%) with frequent misses — "
+                          "ease to a weekly cadence to rebuild momentum without breaking streaks")
+        elif cad == "weekly":
+            if rate >= 0.85 and best >= 4:
+                suggestion = "daily"
+                reason = (f"hitting it nearly every week ({int(rate*100)}%) with a {best}-week best — "
+                          "you may be ready to tighten to daily")
+            elif rate >= 0.4:
+                suggestion, reason = "weekly", f"steady weekly cadence ({int(rate*100)}%) — keep it weekly"
+            else:
+                suggestion, reason = "weekly", (
+                    f"weekly adherence is low ({int(rate*100)}%) — keep weekly and pick a fixed day "
+                    "to anchor the habit")
+        return {"habit": h["name"], "current_cadence": cad,
+                "current_streak": cur, "best_streak": best,
+                "window_days": window, "periods": m["periods"], "period_unit": m["unit"],
+                "completion_rate": rate, "hits": m["hit"], "misses": m["miss"],
+                "suggested_cadence": suggestion, "advice": reason,
+                "change": suggestion != cad}
+
+    sel = (habit or "").strip()
+    if sel:
+        h = _resolve(sel)
+        if not h:
+            return _no_habit(sel)
+        return {"ok": True, "recommendation": _advise(h)}
+    rows = store.query("SELECT * FROM habits WHERE status='active' ORDER BY name")
+    return {"ok": True, "window_days": window,
+            "recommendations": [_advise(h) for h in rows]}
+
+
 if __name__ == "__main__":
     mcp.run()

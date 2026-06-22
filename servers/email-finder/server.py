@@ -16,8 +16,7 @@ import string
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlsplit
 
-import httpx
-from mcp_base import BaseStore, data_dir, db_path, get_env, http, make_server
+from mcp_base import BaseStore, data_dir, db_path, fetch, get_env, http, make_server
 
 MAX_PAGE_BYTES = 2_000_000  # cap each scraped page to avoid memory blowups
 GITHUB_USER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
@@ -453,7 +452,11 @@ def _emails_from_html(html: str) -> dict[str, int]:
 
 
 def _fetch_page_text(url: str, timeout: float = 15.0) -> str:
-    """Fetch one page's HTML, SSRF-guarded, html-only, size-capped, no redirects. '' on any failure."""
+    """Fetch one page's HTML, SSRF-guarded, html-only, size-capped. '' on any failure.
+
+    Routes through mcp_base.fetch for retry/backoff + encoding detection + a post-redirect SSRF
+    re-check. The local pre-check stays so an internal host short-circuits before any network call,
+    and we keep this server's html-only + size-cap contract identical (returns '' on non-HTML/failure)."""
     try:
         full = url if url.startswith("http") else f"https://{url}"
         parts = urlsplit(full)
@@ -462,12 +465,12 @@ def _fetch_page_text(url: str, timeout: float = 15.0) -> str:
         host = (parts.hostname or "").lower()
         if not host or _is_internal_host(host):
             return ""
-        with httpx.Client(timeout=timeout, follow_redirects=False,
-                          headers={"User-Agent": "Mozilla/5.0 (mcp-suite email-finder)"}) as client:
-            r = client.get(full)
-            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
-                return ""
-            return r.text[:MAX_PAGE_BYTES]
+        r = fetch.fetch(full, timeout=timeout, max_bytes=MAX_PAGE_BYTES)
+        if not r.get("ok") or r.get("not_modified"):
+            return ""
+        if "text/html" not in (r.get("content_type") or ""):
+            return ""
+        return (r.get("html") or "")[:MAX_PAGE_BYTES]
     except Exception:
         return ""
 

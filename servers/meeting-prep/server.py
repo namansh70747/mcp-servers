@@ -10,7 +10,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from mcp_base import base_data_dir, make_server, ok
+from mcp_base import base_data_dir, err, make_server, ok
 
 mcp = make_server(
     "meeting-prep",
@@ -197,6 +197,182 @@ def quick_brief(text: str) -> dict:
     brief = build_brief(company=company, attendees=attendees, topic=topic)
     brief["extracted"] = {"company": company, "attendees": attendees, "topic": topic}
     return brief
+
+
+# --- Action-item / decision / question extraction --------------------------------
+
+# Cue phrases that mark a line as an action item, decision, or open question.
+_ACTION_CUES = (
+    "action item", "action:", "todo", "to-do", "to do", "follow up", "follow-up",
+    "followup", "next step", "next steps", "we will", "we'll", "i will", "i'll",
+    "we need to", "you need to", "needs to", "should", "must", "let's", "lets ",
+    "assign", "owner:", "due ", "by eod", "by tomorrow", "by next", "deadline",
+    "take care of", "circle back", "make sure", "ensure ", "send ", "schedule ",
+    "set up", "create ", "draft ", "review ", "prepare ", "deliver ",
+)
+_DECISION_CUES = (
+    "decision", "decided", "we decided", "agreed", "we agreed", "resolved",
+    "approved", "rejected", "going with", "we'll go with", "concluded",
+    "final decision", "consensus", "signed off", "sign off", "green-light",
+    "greenlight", "chose ", "selected ", "opted for",
+)
+# Owner heuristics: "@name", "Name will/to ...", "Name:" prefixes.
+_OWNER_RE = re.compile(r"(?:^|\s)@([A-Za-z][\w.\-]+)")
+_NAME_WILL_RE = re.compile(r"\b([A-Z][a-z]+)\s+(?:will|to|should|is going to|owns|takes)\b")
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split free text into candidate item lines: newlines, then bullets/numbering."""
+    out: list[str] = []
+    for raw in (text or "").splitlines():
+        # Split a single line into multiple if it carries inline bullets.
+        parts = re.split(r"\s+[-*•]\s+", raw)
+        for p in parts:
+            s = p.strip()
+            # Strip leading bullet/number markers.
+            s = re.sub(r"^\s*(?:[-*•]|\d+[.)]|\(\d+\))\s*", "", s).strip()
+            if s:
+                out.append(s)
+    return out
+
+
+def _classify_line(line: str) -> str | None:
+    """Classify a line as 'decision', 'question', 'action' — or None if it's plain prose."""
+    low = line.lower()
+    if line.rstrip().endswith("?") or low.startswith(("q:", "question:", "open question")):
+        return "question"
+    if any(c in low for c in _DECISION_CUES):
+        return "decision"
+    if any(c in low for c in _ACTION_CUES):
+        return "action"
+    return None
+
+
+def _find_owner(line: str) -> str:
+    m = _OWNER_RE.search(line)
+    if m:
+        return m.group(1)
+    m = _NAME_WILL_RE.search(line)
+    if m:
+        return m.group(1)
+    return ""
+
+
+@mcp.tool
+def action_items(text: str) -> dict:
+    """Extract action items, decisions and open questions from free-text meeting notes / a transcript.
+
+    READ-ONLY and offline — pure heuristics over the supplied `text` (no DBs, no network).
+    Splits into candidate lines (newlines + bullets), classifies each via cue phrases and a
+    trailing '?', and guesses an owner from '@name' or 'Name will …'. Returns three buckets
+    plus a flat `items` list. Never raises; empty/garbage input yields empty buckets."""
+    text = text if isinstance(text, str) else ""
+    actions: list[dict] = []
+    decisions: list[dict] = []
+    questions: list[dict] = []
+    seen: set[str] = set()
+    for ln in _split_lines(text):
+        kind = _classify_line(ln)
+        if not kind:
+            continue
+        key = ln.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {"text": ln[:400], "kind": kind}
+        if kind == "action":
+            owner = _find_owner(ln)
+            if owner:
+                item["owner"] = owner
+            actions.append(item)
+        elif kind == "decision":
+            decisions.append(item)
+        else:
+            questions.append(item)
+    items = actions + decisions + questions
+    return ok(
+        actions=actions,
+        decisions=decisions,
+        questions=questions,
+        items=items,
+        counts={"actions": len(actions), "decisions": len(decisions), "questions": len(questions)},
+    )
+
+
+# --- Per-attendee synthesis --------------------------------------------------------
+
+def _name_key(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+@mcp.tool
+def attendee_brief(names: list[str] | None = None) -> dict:
+    """Synthesize a per-attendee dossier from the read-only suite stores (contacts + reachout).
+
+    For each supplied name (or email), gathers any matching CRM contact record and prior
+    outreach history, then derives a short, human-readable summary line. READ-ONLY: never
+    writes, never calls other servers at runtime, degrades gracefully when stores are absent.
+    Never raises — bad/empty input returns an empty briefs list."""
+    if not isinstance(names, list):
+        names = [names] if isinstance(names, str) and names.strip() else []
+    cleaned = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    if not cleaned:
+        return err("no attendee names given", hint="pass a list of names or emails, e.g. ['Ada Lovelace']")
+
+    sources = {
+        "contacts": (base_data_dir() / "contacts" / "store.db").exists(),
+        "reachout": (base_data_dir() / "reachout" / "store.db").exists(),
+    }
+
+    briefs: list[dict] = []
+    for raw in cleaned[:25]:
+        contacts = _contacts_for("", [raw])
+        outreach = _outreach_for("", [raw])
+        replied = [o for o in outreach if o.get("replied_at")]
+
+        # Pick the best-matching contact: exact name/email match preferred.
+        key = _name_key(raw)
+        best = None
+        for c in contacts:
+            if _name_key(c.get("name") or "") == key or _name_key(c.get("email") or "") == key:
+                best = c
+                break
+        if best is None and contacts:
+            best = contacts[0]
+
+        company = (best or {}).get("company") or ""
+        role = (best or {}).get("role") or (best or {}).get("title") or ""
+        last = ""
+        if outreach:
+            last = outreach[0].get("sent_at") or outreach[0].get("subject") or ""
+
+        bits: list[str] = []
+        if role and company:
+            bits.append(f"{role} at {company}")
+        elif company:
+            bits.append(f"at {company}")
+        elif role:
+            bits.append(role)
+        if best and best.get("status"):
+            bits.append(f"status: {best['status']}")
+        if outreach:
+            bits.append(f"{len(outreach)} prior outreach, {len(replied)} replied")
+        else:
+            bits.append("no prior outreach on record")
+        summary = f"{raw} — " + "; ".join(bits) if bits else raw
+
+        briefs.append({
+            "name": raw,
+            "contact": best,
+            "all_contacts": contacts,
+            "outreach": outreach,
+            "outreach_count": len(outreach),
+            "replied_count": len(replied),
+            "last_outreach": last,
+            "summary": summary,
+        })
+
+    return ok(briefs=briefs, count=len(briefs), sources=sources)
 
 
 if __name__ == "__main__":

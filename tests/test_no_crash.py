@@ -19,9 +19,10 @@ from fastmcp import Client  # noqa: E402
 
 # Whole servers skipped (network / credentials / system mutation / file or git writes).
 SKIP_SERVERS = {
-    "mac-control", "homebrew", "gitflow", "codeedit", "scaffold",
+    "mac-control", "deskpilot", "homebrew", "gitflow", "codeedit", "scaffold",
     "apollo", "funding-radar", "news-radar", "email-finder", "github-profile",
     "reachout", "mailbox", "mailmerge", "spotify", "webscrape", "browser", "webengine",
+    "whatsapp", "chrome", "voice",  # drive the user's real Chrome / audio devices — need real macOS I/O
 }
 # Per-tool skips (network calls or writes) inside otherwise-fuzzed servers.
 SKIP_TOOL_SUBSTR = (
@@ -29,6 +30,12 @@ SKIP_TOOL_SUBSTR = (
     "commit", "scan", "fetch", "refresh", "verify", "scrape", "export", "build_site",
     "add_resource", "add_bookmark", "import_", "make_onepager", "onepager_to_pdf",
     "draft_reply", "save_presentation", "screenshot",
+    # videoforge: long-running / model-downloading ffmpeg+whisper jobs. They validate input and
+    # return an err on a bad path before spawning anything, so the cheap analyze/validation tools
+    # (probe/trim/scale/detect_*/project/jobs) are still fuzzed — these names are videoforge-unique.
+    "transcribe", "auto_captions", "make_short", "stabilize", "slideshow", "compress", "auto_reframe",
+    "apply_filter", "chromakey", "mux_subtitles", "blur",  # videoforge do-anything (raw ffmpeg) — heavy
+    "login",  # whatsapp.login launches a VISIBLE browser for the QR scan — never fuzz it
 )
 
 
@@ -75,6 +82,11 @@ async def _seed(name: str, c) -> dict:
             did = (r.data or {}).get("deck_id")
             if did:
                 overrides["deck_id"] = did
+        elif name == "videoforge":
+            r = await c.call_tool("create_project", {"name": "t", "aspect": "16:9"})
+            pid = (r.data or {}).get("project_id")
+            if pid:
+                overrides["project_id"] = pid
     except Exception:
         pass
     return overrides

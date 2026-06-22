@@ -221,6 +221,37 @@ def keyword_audit(text: str, target_role: str) -> dict:
 
 
 @mcp.tool
+def ab_variants(text: str, kind: str = "headline", n: int = 3) -> dict:
+    """Generate N labeled A/B-test variants of a headline/about/bio, each with a distinct angle
+    (impact / keyword-rich / personable / outcome), with a length check so you can pick the best
+    performer. Draft-only — never posts."""
+    text = (text or "").strip()
+    if not text:
+        return {"error": "text is required", "hint": "pass the headline/about copy to vary"}
+    n = max(2, min(int(n) if str(n).isdigit() else 3, 5))
+    limit = LIMITS.get(kind, 220)
+    core = re.split(r"[|—·\n]", text)[0].strip() or text
+    toks = _tokens(text)[:4]
+    kw = " · ".join(toks[:3])
+    angles = [
+        ("impact", core),
+        ("keyword-rich", f"{core} | {kw}" if kw else core),
+        ("personable", f"{core} — {('passionate about ' + toks[0]) if toks else 'always learning'}"),
+        ("outcome", f"{core} | helping teams ship {toks[0] if toks else 'great products'}"),
+        ("concise", core[:80]),
+    ]
+    seen, variants = set(), []
+    for label, v in angles:
+        v = v.strip(" |—-·")
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            variants.append({"label": label, "text": v, "chars": len(v), "within_limit": len(v) <= limit})
+        if len(variants) >= n:
+            break
+    return {"kind": kind, "limit": limit, "variants": variants}
+
+
+@mcp.tool
 def list_target_roles() -> list[str]:
     """List target roles with built-in recruiter keyword sets for keyword_audit."""
     return sorted(ROLE_KEYWORDS)

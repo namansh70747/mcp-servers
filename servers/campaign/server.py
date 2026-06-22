@@ -311,6 +311,143 @@ def record_run(note: str = "") -> dict:
     return {"ok": True, "run_id": rid}
 
 
+def _parse_iso(s: str | None) -> datetime | None:
+    """Tolerant ISO parse — returns None on anything unparseable (never raises)."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    # Normalize naive timestamps to UTC so comparisons against _now() are safe.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _score_row(row: dict, now: datetime, replies: int = 0) -> dict:
+    """Heuristic reply-likelihood for one ledger row. Returns a 0-1 score + factor breakdown.
+
+    Pure function over already-fetched data; never touches the network and never raises.
+    Higher score => better candidate to contact next. Factors:
+      - recency:  longer since last touch => warmer to re-approach (decays in over ~120d)
+      - touches:  more prior sends => fatigue => lower score
+      - replies:  prior replies are a strong positive signal of engagement
+      - cooldown: an active cooldown_until in the future zeroes the score (do-not-contact yet)
+    """
+    last_dt = _parse_iso(row.get("last_contacted_at")) or _parse_iso(row.get("first_contacted_at"))
+    try:
+        touches = int(row.get("count") or 0)
+    except (TypeError, ValueError):
+        touches = 0
+    try:
+        replies = max(0, int(replies or 0))
+    except (TypeError, ValueError):
+        replies = 0
+
+    # Recency: 0 days since last touch -> ~0.1 (too soon), ramping up to ~1.0 around 120 days.
+    if last_dt is None:
+        recency = 1.0  # never contacted (or unknown) -> maximally fresh
+        days_since = None
+    else:
+        days_since = max(0.0, (now - last_dt).total_seconds() / 86400.0)
+        recency = round(min(1.0, 0.1 + 0.9 * min(days_since, 120.0) / 120.0), 4)
+
+    # Fatigue: each prior touch past the first shaves the score; floor at 0.2.
+    fatigue = round(max(0.2, 1.0 - 0.18 * max(0, touches - 1)), 4)
+
+    # Engagement: prior replies are a strong positive (each reply +0.25, capped).
+    engagement = round(min(1.0, replies * 0.25), 4)
+
+    # Active cooldown gate.
+    cd = _parse_iso(row.get("cooldown_until"))
+    cooldown_active = bool(cd and cd > now)
+
+    # Weighted blend, then boosted by engagement, then gated by cooldown.
+    base = 0.55 * recency + 0.45 * fatigue
+    score = base + (1.0 - base) * engagement  # replies pull the score toward 1.0
+    if cooldown_active:
+        score = 0.0
+    score = round(max(0.0, min(1.0, score)), 4)
+
+    return {
+        "company": row.get("company"),
+        "domain": row.get("domain"),
+        "score": score,
+        "touches": touches,
+        "replies": replies,
+        "days_since_last": round(days_since, 1) if days_since is not None else None,
+        "last_contacted_at": row.get("last_contacted_at"),
+        "cooldown_until": row.get("cooldown_until"),
+        "cooldown_active": cooldown_active,
+        "factors": {"recency": recency, "fatigue": fatigue, "engagement": engagement},
+    }
+
+
+@mcp.tool
+def reply_likelihood(company: str = "", domain: str = "", replies: int = 0) -> dict:
+    """Heuristic 0-1 score for how worth-it it is to (re)contact one company next, read-only over
+    the outreach ledger. Blends recency-since-last-touch, send fatigue (#touches), prior `replies`
+    (pass the count if you track engagement elsewhere, e.g. reachout), and an active cooldown gate
+    (cooldown_until in the future -> score 0). Higher = better candidate. Never sends; never raises."""
+    company = (company or "").strip()
+    domain = (domain or "").strip()
+    if not company and not domain:
+        return err("company or domain is required",
+                   hint="pass a company name and/or domain to score")
+    row = store.query_one(
+        "SELECT company, domain, first_contacted_at, last_contacted_at, cooldown_until, count "
+        "FROM ledger WHERE LOWER(COALESCE(domain,''))=? OR LOWER(COALESCE(company,''))=?",
+        (_key("", domain), _key(company, "")),
+    )
+    if not row:
+        # Not in the ledger => never contacted => a maximally-fresh candidate.
+        row = {"company": company or None, "domain": domain or None,
+               "first_contacted_at": None, "last_contacted_at": None,
+               "cooldown_until": None, "count": 0}
+        scored = _score_row(row, _now(), replies=replies)
+        scored["in_ledger"] = False
+        return {"ok": True, **scored}
+    scored = _score_row(row, _now(), replies=replies)
+    scored["in_ledger"] = True
+    return {"ok": True, **scored}
+
+
+@mcp.tool
+def score_contacts(limit: int = 50, include_cooldown: bool = False,
+                   replies_by_company: dict | None = None) -> dict:
+    """Rank every company in the ledger by reply_likelihood so you know who to contact next.
+    Read-only; never raises. By default companies under an active cooldown are excluded (they
+    score 0); pass include_cooldown=True to keep them in the list. Optionally pass
+    replies_by_company={company_or_domain(lowercased): n} to fold in prior-reply counts you
+    track elsewhere. Returns rows sorted high-to-low score."""
+    try:
+        limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    rmap: dict = {}
+    if isinstance(replies_by_company, dict):
+        for k, v in replies_by_company.items():
+            try:
+                rmap[str(k).strip().lower()] = max(0, int(v))
+            except (TypeError, ValueError):
+                continue
+    rows = store.query(
+        "SELECT company, domain, first_contacted_at, last_contacted_at, cooldown_until, count "
+        "FROM ledger ORDER BY last_contacted_at DESC")
+    now = _now()
+    scored = []
+    for r in rows:
+        rep = rmap.get((r.get("domain") or "").strip().lower()) \
+            or rmap.get((r.get("company") or "").strip().lower()) or 0
+        s = _score_row(r, now, replies=rep)
+        if s["cooldown_active"] and not include_cooldown:
+            continue
+        scored.append(s)
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return {"ok": True, "count": len(scored), "ranked": scored[:limit]}
+
+
 @mcp.tool
 def campaign_stats() -> dict:
     """Totals: companies contacted, suppressions, runs."""

@@ -167,6 +167,157 @@ def outdated() -> dict:
     return _brew("outdated")
 
 
+# --------------------------------------------------------------------------- read-only audits / plans
+
+def _digits(s: str) -> tuple[int, ...]:
+    """Extract leading numeric components of a version string as a tuple of ints.
+
+    Handles dotted ('3.2.6'), date-stamped ('20250814.1'), and suffixed ('4.0.2_1') versions.
+    Non-numeric / missing -> empty tuple."""
+    import re
+    parts: list[int] = []
+    for tok in re.split(r"[._\-+]", str(s or "")):
+        m = re.match(r"\d+", tok)
+        if m:
+            parts.append(int(m.group(0)))
+        else:
+            break
+    return tuple(parts)
+
+
+def _version_gap(installed: str, current: str) -> dict:
+    """Best-effort heuristic for how far an installed version is behind the current one.
+
+    Returns {'behind': 'major'|'minor'|'patch'|'unknown', 'major_jump': int, 'far_behind': bool}.
+    `far_behind` flags a major-version jump >= 1, or a date-stamped version that is over a
+    year stale (leading component differs by >= 10000, i.e. a YYYYMMDD bump of a full year)."""
+    iv, cv = _digits(installed), _digits(current)
+    if not iv or not cv:
+        return {"behind": "unknown", "major_jump": 0, "far_behind": False}
+    imaj, cmaj = iv[0], cv[0]
+    major_jump = cmaj - imaj if cmaj > imaj else 0
+    # date-stamped (YYYYMMDD-style, 8-digit) leading component: treat a >=1y delta as far behind
+    date_stamped = imaj >= 10_000_000 and cmaj >= 10_000_000
+    if date_stamped:
+        far = (cmaj - imaj) >= 10000  # ~1 year on a YYYYMMDD stamp
+        return {"behind": "major" if far else "minor", "major_jump": 0, "far_behind": bool(far)}
+    if major_jump >= 1:
+        behind = "major"
+    elif len(cv) > 1 and len(iv) > 1 and cv[1] > iv[1]:
+        behind = "minor"
+    else:
+        behind = "patch"
+    return {"behind": behind, "major_jump": int(major_jump), "far_behind": major_jump >= 1}
+
+
+@mcp.tool
+def security_audit(major_only: bool = False) -> dict:
+    """Read-only audit of outdated formulae & casks, flagging packages that are FAR BEHIND.
+
+    Runs `brew outdated --json=v2` (no network mutation, never installs/upgrades) and computes a
+    best-effort version gap for each package. A package is `far_behind` when it is at least one
+    major version behind (or a date-stamped version that is ~1 year+ stale). Pinned packages are
+    reported but excluded from the upgrade recommendation.
+
+    major_only=True returns only the far-behind packages in the lists. Always returns a dict; never raises."""
+    r = _brew_json("outdated", "--json=v2")
+    if not r.get("ok"):
+        return {"ok": False, "err": r.get("err", "could not run brew outdated"),
+                "hint": "ensure Homebrew is installed (https://brew.sh)"}
+    data = r.get("data") or {}
+    formulae_out: list[dict] = []
+    casks_out: list[dict] = []
+    for kind, src, dest in (("formula", data.get("formulae", []), formulae_out),
+                            ("cask", data.get("casks", []), casks_out)):
+        for item in src or []:
+            if not isinstance(item, dict):
+                continue
+            installed_list = item.get("installed_versions") or []
+            installed = installed_list[0] if installed_list else ""
+            current = item.get("current_version") or ""
+            gap = _version_gap(installed, current)
+            entry = {
+                "name": item.get("name"),
+                "kind": kind,
+                "installed": installed,
+                "current": current,
+                "pinned": bool(item.get("pinned")),
+                "behind": gap["behind"],
+                "major_jump": gap["major_jump"],
+                "far_behind": gap["far_behind"],
+            }
+            if major_only and not gap["far_behind"]:
+                continue
+            dest.append(entry)
+    all_items = formulae_out + casks_out
+    far = [e for e in all_items if e["far_behind"]]
+    pinned = [e for e in all_items if e["pinned"]]
+    upgradable = [e["name"] for e in all_items if not e["pinned"] and e["name"]]
+    return {
+        "ok": True,
+        "total_outdated": len(all_items),
+        "far_behind_count": len(far),
+        "formulae": formulae_out,
+        "casks": casks_out,
+        "far_behind": far,
+        "pinned": [e["name"] for e in pinned],
+        "recommend_upgrade": upgradable,
+        "hint": "review then run upgrade(name=..., confirm=True); pinned packages need unpin() first" if upgradable else "everything up to date",
+    }
+
+
+def _parse_cleanup_freed(out: str) -> dict:
+    """Pull the 'would free approximately <N><unit>' summary from a `brew cleanup --dry-run` run.
+
+    Returns {'human': '122.6MB', 'mb': 122.6} or {'human': None, 'mb': 0.0} when absent."""
+    import re
+    m = re.search(r"free approximately\s+([\d.,]+)\s*([KMGT]?B)", out or "", re.IGNORECASE)
+    if not m:
+        return {"human": None, "mb": 0.0}
+    num = float(m.group(1).replace(",", ""))
+    unit = m.group(2).upper()
+    factor = {"B": 1 / 1_048_576, "KB": 1 / 1024, "MB": 1.0, "GB": 1024.0, "TB": 1024.0 * 1024.0}.get(unit, 1.0)
+    return {"human": f"{m.group(1)}{m.group(2)}", "mb": round(num * factor, 2)}
+
+
+@mcp.tool
+def cleanup_plan() -> dict:
+    """Dry-run plan of reclaimable disk space: `brew cleanup --dry-run` + unused dependency leaves.
+
+    Strictly read-only — never removes anything. Combines:
+      - `brew cleanup --dry-run`: stale downloads / old versions, with the 'would free' estimate.
+      - `brew autoremove --dry-run`: formulae installed only as dependencies that are now unneeded.
+    Returns the previews plus a count of removable items and the estimated MB freed. Never raises;
+    to actually reclaim space call cleanup(dry_run=False, confirm=True) / autoremove(dry_run=False, confirm=True)."""
+    c = _brew("cleanup", "--dry-run", timeout=300)
+    a = _brew("autoremove", "--dry-run", timeout=300)
+    cleanup_lines = _lines(c.get("out", "")) if c.get("ok") else []
+    would_remove = [ln for ln in cleanup_lines if ln.lower().startswith("would remove")]
+    freed = _parse_cleanup_freed(c.get("out", "")) if c.get("ok") else {"human": None, "mb": 0.0}
+    auto_lines = _lines(a.get("out", "")) if a.get("ok") else []
+    # autoremove dry-run prints a "Would remove:" header then formula names; collect plausible names
+    unused_leaves = []
+    for ln in auto_lines:
+        s = ln.strip()
+        low = s.lower()
+        if low.startswith("==>") or low.startswith("would remove") or "autoremove" in low:
+            continue
+        unused_leaves.append(s)
+    return {
+        "ok": bool(c.get("ok") or a.get("ok")),
+        "estimated_freed": freed["human"],
+        "estimated_freed_mb": freed["mb"],
+        "cleanup_removable_count": len(would_remove),
+        "cleanup_preview": would_remove[:200],
+        "unused_leaves": unused_leaves[:200],
+        "unused_leaves_count": len(unused_leaves),
+        "cleanup_ok": bool(c.get("ok")),
+        "autoremove_ok": bool(a.get("ok")),
+        "errors": {k: v for k, v in (("cleanup", c.get("err")), ("autoremove", a.get("err"))) if v and not (c.get("ok") if k == "cleanup" else a.get("ok"))},
+        "hint": "to reclaim: cleanup(dry_run=False, confirm=True) and/or autoremove(dry_run=False, confirm=True)",
+    }
+
+
 @mcp.tool
 def doctor() -> dict:
     """Run `brew doctor` to diagnose common issues (read-only)."""

@@ -8,7 +8,7 @@ import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, db_path, err, make_server, not_found
+from mcp_base import BaseStore, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "jobtrack",
@@ -53,7 +53,23 @@ _ensure_columns("applications", {
     "updated_at": "TEXT",
     "contact_id": "INTEGER",
     "archived_at": "TEXT",
+    "jd_text": "TEXT DEFAULT ''",  # optional full job-description text (powers match_score)
 })
+
+# Sidecar vector table for hybrid semantic search over applications. Degrades to keyword-only
+# when no local embedding model is installed (semantic.* is a no-op in that case).
+store.migrate(semantic.vec_table_sql("jobtrack_vec"))
+
+_VEC_COLS = ("company", "role", "jd_url", "jd_text", "notes")
+
+
+def _reindex(rid: int) -> None:
+    """(Re)embed one application's searchable text. No-op without an embedding model."""
+    r = store.query_one(
+        "SELECT company,role,jd_url,jd_text,notes FROM applications WHERE id=?", (rid,))
+    if r:
+        semantic.index_row(store, "jobtrack_vec", rid,
+                           " ".join(str(r.get(k) or "") for k in _VEC_COLS))
 
 
 def _now() -> str:
@@ -69,20 +85,21 @@ def _recent_application_ids(limit: int = 10) -> list[int]:
 def _add_application(company: str, role: str, jd_url: str = "", status: str = "applied",
                      followup_in_days: int = 7, notes: str = "", contact_name: str = "",
                      contact_email: str = "", location: str = "", salary: str = "",
-                     source: str = "", contact_id: int | None = None) -> dict:
+                     source: str = "", contact_id: int | None = None, jd_text: str = "") -> dict:
     if not (company or "").strip() or not (role or "").strip():
         return {"error": "company and role are required"}
     if status not in STATUSES:
         return {"error": f"status must be one of {STATUSES}"}
     nf = (datetime.now(timezone.utc) + timedelta(days=followup_in_days)).isoformat()
     aid = store.execute(
-        "INSERT INTO applications(company,role,jd_url,status,applied_at,next_followup,notes,"
+        "INSERT INTO applications(company,role,jd_url,jd_text,status,applied_at,next_followup,notes,"
         "contact_name,contact_email,location,salary,source,contact_id,created_at,updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (company, role, jd_url, status, _now(), nf, notes, contact_name, contact_email,
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (company, role, jd_url, jd_text, status, _now(), nf, notes, contact_name, contact_email,
          location, salary, source, contact_id, _now(), _now()))
     store.execute("INSERT INTO status_history(application_id,status,changed_at) VALUES(?,?,?)",
                   (aid, status, _now()))
+    _reindex(aid)
     return {"id": aid, "company": company, "role": role, "status": status}
 
 
@@ -90,11 +107,13 @@ def _add_application(company: str, role: str, jd_url: str = "", status: str = "a
 def add_application(company: str, role: str, jd_url: str = "", status: str = "applied",
                     followup_in_days: int = 7, notes: str = "", contact_name: str = "",
                     contact_email: str = "", location: str = "", salary: str = "",
-                    source: str = "", contact_id: int | None = None) -> dict:
+                    source: str = "", contact_id: int | None = None, jd_text: str = "") -> dict:
     """Log an application. Sets a follow-up reminder N days out. Optional contact/location/source.
-    Optional `contact_id` links to a contacts-server record (P2 cross-server identity)."""
+    Optional `contact_id` links to a contacts-server record (P2 cross-server identity).
+    Optional `jd_text` stores the full job-description text (improves search + match_score)."""
     return _add_application(company, role, jd_url, status, followup_in_days, notes,
-                            contact_name, contact_email, location, salary, source, contact_id)
+                            contact_name, contact_email, location, salary, source, contact_id,
+                            jd_text)
 
 
 @mcp.tool
@@ -109,6 +128,8 @@ def update_status(application_id: int, status: str, notes: str = "") -> dict:
                   (status, notes, _now(), application_id))
     store.execute("INSERT INTO status_history(application_id,status,changed_at) VALUES(?,?,?)",
                   (application_id, status, _now()))
+    if (notes or "").strip():
+        _reindex(application_id)
     return {"ok": True, "id": application_id, "status": status}
 
 
@@ -183,6 +204,7 @@ def delete_application(application_id: int) -> dict:
     store.execute("DELETE FROM interviews WHERE application_id=?", (application_id,))
     store.execute("DELETE FROM status_history WHERE application_id=?", (application_id,))
     store.execute("DELETE FROM applications WHERE id=?", (application_id,))
+    semantic.drop_row(store, "jobtrack_vec", application_id)
     return {"ok": True, "id": application_id, "deleted": True}
 
 
@@ -220,6 +242,7 @@ def add_note(application_id: int, note: str) -> dict:
     merged = (app["notes"] + "\n" if app["notes"] else "") + f"[{stamp}] {note}"
     store.execute("UPDATE applications SET notes=?, updated_at=? WHERE id=?",
                   (merged, _now(), application_id))
+    _reindex(application_id)
     return {"ok": True, "id": application_id, "notes": merged}
 
 
@@ -237,12 +260,143 @@ def set_followup(application_id: int, in_days: int = 7) -> dict:
 
 @mcp.tool
 def search(query: str, limit: int = 50) -> list[dict]:
-    """Search applications by company, role, location, or notes (substring)."""
-    like = f"%{query}%"
-    return store.query(
-        "SELECT id,company,role,status,location FROM applications "
+    """Hybrid search across company / role / job description / notes: keyword (substring) fused with
+    semantic vector similarity so a query like 'distributed backend in Berlin' surfaces relevant roles
+    even without those exact words. Falls back to keyword-only when no embedding model is installed."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    fts_ids = [r["id"] for r in store.query(
+        "SELECT id FROM applications "
         "WHERE company LIKE ? OR role LIKE ? OR location LIKE ? OR notes LIKE ? "
-        "ORDER BY applied_at DESC LIMIT ?", (like, like, like, like, limit))
+        "OR jd_url LIKE ? OR jd_text LIKE ? "
+        "ORDER BY applied_at DESC LIMIT 50", (like, like, like, like, like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "jobtrack_vec", q, limit=50)]
+    ids = semantic.rrf(fts_ids, vec, max(1, limit)) if vec else fts_ids[:max(1, limit)]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,company,role,status,location FROM applications WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+# --- keyword extraction + JD/résumé matching --------------------------------
+_STOP = {
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "as", "at", "by", "is",
+    "are", "be", "will", "we", "you", "our", "your", "their", "they", "this", "that", "these",
+    "those", "it", "its", "from", "into", "over", "per", "via", "etc", "e", "g", "ie", "eg",
+    "able", "have", "has", "had", "who", "what", "when", "where", "which", "such", "than", "then",
+    "also", "but", "not", "all", "any", "can", "may", "should", "must", "would", "could", "do",
+    "does", "job", "role", "work", "working", "team", "company", "experience", "years", "year",
+    "strong", "good", "great", "excellent", "ability", "including", "include", "includes", "plus",
+    "preferred", "required", "requirements", "responsibilities", "skills", "looking", "candidate",
+    "candidates", "ideal", "across", "within", "using", "use", "used", "help", "build", "building",
+}
+
+
+def _keywords(text: str) -> set[str]:
+    """Lowercased significant tokens (length >= 3, not a stopword). Splits on non-alphanumerics but
+    keeps intra-word + and # so 'c++' / 'c#' / 'node.js' survive reasonably."""
+    if not (text or "").strip():
+        return set()
+    out: set[str] = set()
+    token = ""
+    for ch in text.lower():
+        if ch.isalnum() or ch in "+#.":
+            token += ch
+        else:
+            if token:
+                out.add(token)
+            token = ""
+    if token:
+        out.add(token)
+    cleaned: set[str] = set()
+    for t in out:
+        t = t.strip(".")
+        if len(t) >= 3 and t not in _STOP and not t.isdigit():
+            cleaned.add(t)
+    return cleaned
+
+
+def _profile_terms() -> set[str]:
+    """Best-effort keyword set drawn from profile.json (skills/experience/projects/headline)."""
+    try:
+        import json
+        from mcp_base import repo_root
+        p = repo_root() / "profile.json"
+        if not p.is_file():
+            return set()
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    parts: list[str] = []
+
+    def _collect(v) -> None:
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, list):
+            for x in v:
+                _collect(x)
+        elif isinstance(v, dict):
+            for x in v.values():
+                _collect(x)
+
+    for key in ("headline", "summary", "skills", "experience", "projects", "education"):
+        _collect(data.get(key))
+    return _keywords(" ".join(parts))
+
+
+@mcp.tool
+def match_score(application_id: int, resume_text: str = "") -> dict:
+    """Score how well a résumé/profile matches an application's job description (0..1) and list the
+    missing JD keywords to address.
+
+    Compares the significant terms in the application's company/role/jd_url/jd_text/notes against the
+    terms in `resume_text` (if given) or, when empty, your profile.json. Returns overlap ratio plus the
+    matched and missing keywords. Purely lexical — never raises, no model required."""
+    app = store.query_one(
+        "SELECT company,role,jd_url,jd_text,notes FROM applications WHERE id=?", (application_id,))
+    if not app:
+        return not_found("application", application_id, available=_recent_application_ids(),
+                         hint="use list_pipeline()")
+    jd_terms = _keywords(" ".join(str(app.get(k) or "") for k in _VEC_COLS))
+    if not jd_terms:
+        return err("no job-description text to score against",
+                   id=application_id,
+                   hint="add jd_text via add_application(..., jd_text=...) or import_csv, "
+                        "or append role detail with add_note()")
+    source = "resume_text"
+    cand_terms = _keywords(resume_text)
+    if not cand_terms:
+        cand_terms = _profile_terms()
+        source = "profile.json"
+    matched = sorted(jd_terms & cand_terms)
+    missing = sorted(jd_terms - cand_terms)
+    score = round(len(matched) / len(jd_terms), 3) if jd_terms else 0.0
+    return {
+        "ok": True,
+        "id": application_id,
+        "compared_against": source,
+        "score": score,
+        "matched_count": len(matched),
+        "jd_keyword_count": len(jd_terms),
+        "matched": matched[:50],
+        "missing": missing[:50],
+    }
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all applications. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM applications"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 _CSV_COLS = ["company", "role", "status", "jd_url", "location", "salary", "source",
@@ -289,7 +443,7 @@ def import_csv(path: str) -> dict:
                 company, role, jd_url=row.get("jd_url", ""), status=status, notes=row.get("notes", ""),
                 contact_name=row.get("contact_name", ""), contact_email=row.get("contact_email", ""),
                 location=row.get("location", ""), salary=row.get("salary", ""),
-                source=row.get("source", ""))
+                source=row.get("source", ""), jd_text=row.get("jd_text", ""))
             added += 1
     return {"ok": True, "added": added, "skipped": skipped}
 

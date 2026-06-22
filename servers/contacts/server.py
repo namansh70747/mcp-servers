@@ -11,7 +11,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, semantic
 
 mcp = make_server(
     "contacts",
@@ -33,6 +33,7 @@ CREATE INDEX IF NOT EXISTS idx_contacts_company ON contacts(company);
 CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
 """
 store = BaseStore(db_path("contacts"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("contacts_vec"))
 OUT = data_dir("contacts")
 STATUSES = {"new", "queued", "contacted", "replied", "bounced", "closed"}
 MAX_IMPORT_BYTES = 25 * 1024 * 1024  # 25 MB cap on CSV import
@@ -41,6 +42,18 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_VEC_COLS = ("name", "company", "title", "role", "notes", "tags")
+
+
+def _reindex(cid: int) -> None:
+    """(Re)build the semantic vector for one contact from its searchable text columns. No-op without a model."""
+    r = store.query_one(
+        "SELECT name,company,title,role,notes,tags FROM contacts WHERE id=?", (cid,))
+    if r:
+        semantic.index_row(store, "contacts_vec", cid,
+                           " ".join(str(r.get(k) or "") for k in _VEC_COLS))
 
 
 def _recent_contact_ids(limit: int = 10) -> list[int]:
@@ -115,29 +128,94 @@ def add_contact(name: str, company: str, email: str = "", role: str = "", title:
         (name, email, company, domain, role, title, linkedin, github, twitter, phone, tags,
          source, confidence, notes, now, now),
     )
+    # On an upsert conflict SQLite returns the would-be rowid (not the updated row's id), so resolve
+    # the canonical id by the unique key before indexing.
+    row = store.query_one("SELECT id FROM contacts WHERE email=? AND company=?", (email, company))
+    cid = row["id"] if row else cid
+    _reindex(cid)
     return {"id": cid, "name": name, "company": company, "email": email}
+
+
+_FIND_COLS = "id,name,email,company,role,title,status,confidence,tags"
 
 
 @mcp.tool
 def find(query: str = "", company: str = "", status: str = "", tag: str = "", limit: int = 25) -> list[dict]:
-    """Search contacts by free text (name/email/role/title) and/or company/status/tag filters."""
-    sql = "SELECT id,name,email,company,role,title,status,confidence,tags FROM contacts WHERE 1=1"
-    params: list = []
-    if query:
-        sql += " AND (name LIKE ? OR email LIKE ? OR role LIKE ? OR title LIKE ?)"
-        params += [f"%{query}%"] * 4
+    """Search contacts by free text (name/company/title/role/notes/tags) and/or company/status/tag filters.
+
+    When `query` is given this is a HYBRID search: keyword (LIKE) fused with semantic vector similarity
+    via reciprocal-rank fusion, so 'infra hiring lead' surfaces a relevant contact even without those
+    exact words. Falls back to keyword-only when no embedding model is installed. Any of
+    company/status/tag further constrain the results. With no query at all it lists recent matches."""
+    limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 25, 200))
+    q = (query or "").strip()
+
+    # Build the structured filter clause shared by both paths.
+    filt, fparams = "", []
     if company:
-        sql += " AND company LIKE ?"
-        params.append(f"%{company}%")
+        filt += " AND company LIKE ?"; fparams.append(f"%{company}%")
     if status:
-        sql += " AND status = ?"
-        params.append(status)
+        filt += " AND status = ?"; fparams.append(status)
     if tag:
-        sql += " AND tags LIKE ?"
-        params.append(f"%{tag}%")
-    sql += " ORDER BY updated_at DESC LIMIT ?"
-    params.append(limit)
-    return store.query(sql, params)
+        filt += " AND tags LIKE ?"; fparams.append(f"%{tag}%")
+
+    if not q:
+        # No free-text term: keep the original filter-only listing behavior.
+        return store.query(
+            f"SELECT {_FIND_COLS} FROM contacts WHERE 1=1{filt} ORDER BY updated_at DESC LIMIT ?",
+            (*fparams, limit))
+
+    like = f"%{q}%"
+    kw_ids = [r["id"] for r in store.query(
+        f"SELECT id FROM contacts WHERE (name LIKE ? OR email LIKE ? OR company LIKE ? "
+        f"OR role LIKE ? OR title LIKE ? OR notes LIKE ? OR tags LIKE ?){filt} "
+        f"ORDER BY updated_at DESC LIMIT 50",
+        (like, like, like, like, like, like, like, *fparams))]
+    vec_ids = [rid for rid, _ in semantic.vector_hits(store, "contacts_vec", q, limit=50)]
+    ids = semantic.rrf(kw_ids, vec_ids, limit) if vec_ids else kw_ids[:limit]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT {_FIND_COLS} FROM contacts WHERE id IN ({ph}){filt}", (*ids, *fparams))}
+    # Preserve fused rank order; filters above may have dropped some ids.
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def find_similar(contact_id: int, limit: int = 10) -> list[dict]:
+    """Find contacts semantically similar to a given one (by name/company/title/role/notes/tags).
+
+    Useful for clustering near-duplicates or finding people in adjacent roles/companies. Returns []
+    (never raises) for a bad id or when no embedding model is installed (uv sync --group embed)."""
+    limit = max(1, min(int(limit) if isinstance(limit, (int, float)) else 10, 200))
+    row = store.query_one(
+        "SELECT name,company,title,role,notes,tags FROM contacts WHERE id=?", (contact_id,))
+    if not row:
+        return []
+    seed = " ".join(str(row.get(k) or "") for k in _VEC_COLS).strip()
+    if not seed:
+        return []
+    hits = semantic.vector_hits(store, "contacts_vec", seed, limit=limit + 1)
+    ids = [rid for rid, _ in hits if rid != contact_id][:limit]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT {_FIND_COLS} FROM contacts WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all contacts. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM contacts"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool
@@ -198,6 +276,7 @@ def enrich_from_signature(contact_id: int, signature: str) -> dict:
     if sets:
         params += [_now(), contact_id]
         store.execute(f"UPDATE contacts SET {','.join(sets)}, updated_at=? WHERE id=?", params)
+        _reindex(contact_id)
     return {"ok": True, "id": contact_id, "found": found}
 
 
@@ -227,6 +306,7 @@ def tag(contact_id: int, tags: str) -> dict:
                          hint="use list_contacts() or find()")
     merged = _merge_tags(row.get("tags") or "", tags)
     store.execute("UPDATE contacts SET tags=?, updated_at=? WHERE id=?", (merged, _now(), contact_id))
+    _reindex(contact_id)
     return {"ok": True, "id": contact_id, "tags": merged}
 
 
@@ -244,6 +324,7 @@ def untag(contact_id: int, tags: str) -> dict:
             if t.strip() and t.strip().lower() not in drop]
     merged = ",".join(kept)
     store.execute("UPDATE contacts SET tags=?, updated_at=? WHERE id=?", (merged, _now(), contact_id))
+    _reindex(contact_id)
     return {"ok": True, "id": contact_id, "tags": merged}
 
 
@@ -368,10 +449,12 @@ def merge_contacts(keep_id: int, dup_id: int) -> dict:
     params.append(keep_id)
     # email+company uniqueness: drop dup first to avoid conflict if we copy its email
     store.execute("DELETE FROM contacts WHERE id=?", (dup_id,))
+    semantic.drop_row(store, "contacts_vec", dup_id)
     try:
         store.execute(f"UPDATE contacts SET {','.join(sets)} WHERE id=?", params)
     except Exception:  # noqa: BLE001 — conflict; keep stays as-is
         pass
+    _reindex(keep_id)
     return {"ok": True, "kept": keep_id, "removed": dup_id, "tags": merged_tags}
 
 

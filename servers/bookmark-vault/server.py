@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import (BaseStore, data_dir, db_path, err, fetch as _hfetch, make_server, not_found,
+                      scrape, semantic)
 
 mcp = make_server(
     "bookmark-vault",
@@ -32,6 +33,15 @@ CREATE TRIGGER IF NOT EXISTS bm_ad AFTER DELETE ON bookmarks BEGIN
 CREATE VIRTUAL TABLE IF NOT EXISTS bm_content_fts USING fts5(content, tokenize='porter');
 """
 store = BaseStore(db_path("bookmark-vault"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("bm_vec"))
+
+
+def _reindex(bid: int) -> None:
+    """Sync a bookmark's semantic vector from its title/tags/notes/archived text."""
+    b = store.query_one("SELECT title,tags,notes,archive_text FROM bookmarks WHERE id=?", (bid,))
+    if b:
+        txt = " ".join(str(b.get(k) or "") for k in ("title", "tags", "notes", "archive_text"))
+        semantic.index_row(store, "bm_vec", bid, txt)
 
 
 def _now():
@@ -103,31 +113,13 @@ _MAX_FETCH_BYTES = 5_000_000  # cap downloaded page size (~5MB) to bound memory
 
 
 def _fetch(url: str) -> tuple[str, str]:
-    """Return (title, main_text) for a URL. Empty strings on failure. Lazy imports; offline-safe."""
-    url = (url or "").strip()
-    if not url.lower().startswith(("http://", "https://")):
+    """Return (title, main_text) for a URL via the hardened shared fetch (SSRF-guarded, retry, encoding
+    detection). Empty strings on failure. Offline-safe."""
+    r = _hfetch.fetch(url, timeout=12, max_bytes=_MAX_FETCH_BYTES)
+    if not r.get("ok") or r.get("not_modified"):
         return "", ""
-    try:
-        import httpx
-        from bs4 import BeautifulSoup
-        with httpx.stream("GET", url, timeout=12, follow_redirects=True,
-                          headers={"User-Agent": "Mozilla/5.0"}) as r:
-            chunks, total = [], 0
-            for chunk in r.iter_bytes():
-                chunks.append(chunk)
-                total += len(chunk)
-                if total >= _MAX_FETCH_BYTES:
-                    break
-            html = b"".join(chunks).decode(r.encoding or "utf-8", errors="ignore")
-        soup = BeautifulSoup(html, "html.parser")
-        title = (soup.title.string or "").strip()[:300] if soup.title else ""
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
-            tag.decompose()
-        main = soup.find("article") or soup.find("main") or soup.body or soup
-        text = re.sub(r"\n{3,}", "\n\n", main.get_text("\n", strip=True))
-        return title, text
-    except Exception:
-        return "", ""
+    html = r.get("html", "")
+    return scrape.title(html)[:300], scrape.main_content(html, r.get("final_url", url), "text")
 
 
 def _fetch_title(url: str) -> str:
@@ -163,9 +155,11 @@ def add_bookmark(url: str, title: str = "", tags: str = "", notes: str = "", fet
         "archive_text=COALESCE(NULLIF(excluded.archive_text,''),bookmarks.archive_text),"
         "archived_at=COALESCE(NULLIF(excluded.archived_at,''),bookmarks.archived_at)",
         (url, title, tags, notes, archive_text, _now() if archive_text else "", _now()))
+    row = store.query_one("SELECT id FROM bookmarks WHERE url=?", (url,))
+    bid = row["id"] if row else bid
     if archive_text:
-        row = store.query_one("SELECT id FROM bookmarks WHERE url=?", (url,))
-        _index_content(row["id"], archive_text)
+        _index_content(bid, archive_text)
+    _reindex(bid)
     return {"id": bid, "url": url, "title": title, "archived": bool(archive_text)}
 
 
@@ -191,7 +185,47 @@ def search(query: str, limit: int = 20, content: bool = False) -> list[dict]:
                 results.setdefault(r["id"], r)
         except Exception:
             pass
+    # semantic layer: fuse vector hits with the keyword hits (reciprocal-rank fusion)
+    vec = [rid for rid, _ in semantic.vector_hits(store, "bm_vec", query, limit=50)]
+    if vec:
+        fused = semantic.rrf(list(results.keys()), vec, limit)
+        need = [i for i in fused if i not in results]
+        if need:
+            ph = ",".join("?" * len(need))
+            for r in store.query(f"SELECT id,title,url,tags FROM bookmarks WHERE id IN ({ph})", tuple(need)):
+                results[r["id"]] = r
+        return [results[i] for i in fused if i in results][:limit]
     return list(results.values())[:limit]
+
+
+@mcp.tool
+def find_similar(bookmark_id: int = 0, url: str = "", limit: int = 8) -> dict:
+    """Find bookmarks semantically similar to a given one (by meaning of title/notes/archived text)."""
+    b = (store.query_one("SELECT id,title,tags,notes,archive_text FROM bookmarks WHERE id=?", (bookmark_id,))
+         if bookmark_id else
+         store.query_one("SELECT id,title,tags,notes,archive_text FROM bookmarks WHERE url=?", ((url or "").strip(),)))
+    if not b:
+        return err("bookmark not found", hint="pass a valid bookmark_id or url")
+    txt = " ".join(str(b.get(k) or "") for k in ("title", "tags", "notes", "archive_text"))
+    hits = [rid for rid, _ in semantic.vector_hits(store, "bm_vec", txt, limit=limit + 1) if rid != b["id"]]
+    ids = hits[:max(1, limit)]
+    if not ids:
+        return {"ok": True, "results": [], "note": "no semantic neighbors (try archive=True / reindex_semantic)"}
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(f"SELECT id,title,url,tags FROM bookmarks WHERE id IN ({ph})", tuple(ids))}
+    return {"ok": True, "results": [rows[i] for i in ids if i in rows]}
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all bookmarks. Needs a local model (uv sync --group embed)."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM bookmarks"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool
@@ -251,6 +285,7 @@ def delete_bookmark(bookmark_id: int) -> dict:
         return _no_bookmark(bookmark_id)
     store.execute("DELETE FROM bm_content_fts WHERE rowid=?", (bookmark_id,))
     store.execute("DELETE FROM bookmarks WHERE id=?", (bookmark_id,))
+    semantic.drop_row(store, "bm_vec", bookmark_id)
     return {"ok": True, "id": bookmark_id}
 
 
@@ -277,6 +312,7 @@ def archive(bookmark_id: int = 0, url: str = "") -> dict:
     store.execute("UPDATE bookmarks SET archive_text=?, archived_at=?, "
                   "title=COALESCE(NULLIF(title,''),?) WHERE id=?", (text, _now(), title, bid))
     _index_content(bid, text)
+    _reindex(bid)
     return {"ok": True, "id": bid, "chars": len(text)}
 
 

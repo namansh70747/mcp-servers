@@ -159,6 +159,78 @@ def search(query: str, limit: int = 25) -> list[dict]:
             (like, like, limit))
 
 
+_STOP = {"the", "a", "an", "and", "or", "to", "of", "in", "for", "on", "with", "is", "are", "be",
+         "this", "that", "it", "as", "at", "by", "from", "how", "why", "what", "new", "your", "you",
+         "we", "our", "i", "s", "t", "will", "can", "has", "have", "but", "not", "all", "do", "if"}
+
+
+def _terms(text: str) -> set:
+    import re as _re
+    return {w for w in _re.findall(r"[a-z0-9]{3,}", (text or "").lower()) if w not in _STOP}
+
+
+@mcp.tool
+def summarize_feed(feed_id: int = 0, limit: int = 40) -> dict:
+    """Digest recent items: top recurring topics (shared terms across headlines) + the items per topic.
+    Offline; gives an at-a-glance 'what's this feed about lately'."""
+    limit = _clamp_limit(limit, 40)
+    where = "WHERE feed_id=?" if feed_id else ""
+    params = ((feed_id,) if feed_id else ()) + (limit,)
+    rows = store.query(f"SELECT id,title,link,summary FROM items {where} ORDER BY fetched_at DESC LIMIT ?",
+                       params if feed_id else (limit,))
+    freq: dict[str, int] = {}
+    for r in rows:
+        for w in _terms(f"{r['title']} {r['summary']}"):
+            freq[w] = freq.get(w, 0) + 1
+    topics = [w for w, n in sorted(freq.items(), key=lambda kv: -kv[1]) if n >= 2][:12]
+    return {"items_scanned": len(rows), "top_topics": topics,
+            "headlines": [{"id": r["id"], "title": r["title"], "link": r["link"]} for r in rows[:15]]}
+
+
+@mcp.tool
+def cluster(limit: int = 60) -> dict:
+    """Group recent items into clusters by shared key terms (lightweight topic clustering, offline)."""
+    limit = _clamp_limit(limit, 60)
+    rows = store.query("SELECT id,title,link FROM items ORDER BY fetched_at DESC LIMIT ?", (limit,))
+    items = [{"id": r["id"], "title": r["title"], "link": r["link"], "terms": _terms(r["title"])} for r in rows]
+    clusters: list[dict] = []
+    used = set()
+    for i, a in enumerate(items):
+        if a["id"] in used or not a["terms"]:
+            continue
+        group = [a]
+        used.add(a["id"])
+        for b in items[i + 1:]:
+            if b["id"] in used:
+                continue
+            overlap = a["terms"] & b["terms"]
+            if len(overlap) >= 2:
+                group.append(b)
+                used.add(b["id"])
+        if len(group) > 1:
+            common = set.intersection(*[g["terms"] for g in group]) or a["terms"]
+            clusters.append({"topic": " ".join(sorted(common)[:4]),
+                             "items": [{"id": g["id"], "title": g["title"], "link": g["link"]} for g in group]})
+    clusters.sort(key=lambda c: -len(c["items"]))
+    return {"clusters": clusters[:15], "clustered": len(used), "total": len(items)}
+
+
+@mcp.tool
+def export_to_notes(limit: int = 30, unread_only: bool = True) -> dict:
+    """Build a markdown payload of recent items (a reading list) to hand to the notes server
+    (notes.new_note(title, body)). Read-only; returns the title + body, does not write."""
+    limit = _clamp_limit(limit, 30)
+    where = "WHERE read=0" if unread_only else ""
+    rows = store.query(f"SELECT i.title,i.link,f.title AS feed FROM items i "
+                       f"LEFT JOIN feeds f ON f.id=i.feed_id {where} ORDER BY i.fetched_at DESC LIMIT ?",
+                       (limit,))
+    lines = [f"- [{r['title']}]({r['link']})" + (f"  _( {r['feed']} )_" if r.get("feed") else "")
+             for r in rows]
+    body = "# RSS reading list\n\n" + "\n".join(lines) if lines else "# RSS reading list\n\n(nothing)"
+    return {"ok": True, "title": "RSS reading list", "body": body, "count": len(rows),
+            "hint": "pass title+body to notes.new_note to save it"}
+
+
 @mcp.tool
 def remove_feed(feed_id: int) -> dict:
     """Unsubscribe from a feed and delete all its items."""

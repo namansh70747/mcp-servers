@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-from mcp_base import BaseStore, db_path, make_server, not_found
+from mcp_base import BaseStore, db_path, make_server, not_found, semantic
 
 mcp = make_server(
     "interview-prep",
@@ -67,6 +67,27 @@ _ensure_cols("problems", {
     "solved_at": "TEXT",
 })
 
+# Sidecar vector tables for semantic search (hybrid keyword+vector). Sit alongside the
+# parent rows; populated on write, dropped on delete. No-op when no embedding model is present.
+store.migrate(semantic.vec_table_sql("iprep_problems_vec"))
+store.migrate(semantic.vec_table_sql("iprep_cards_vec"))
+
+
+def _reindex_problem(pid: int) -> None:
+    """(Re)embed a problem from its title/pattern/topic/difficulty. Never raises."""
+    r = store.query_one("SELECT title,pattern,topic,difficulty FROM problems WHERE id=?", (pid,))
+    if r:
+        txt = " ".join(str(r.get(k) or "") for k in ("title", "pattern", "topic", "difficulty"))
+        semantic.index_row(store, "iprep_problems_vec", pid, txt)
+
+
+def _reindex_card(cid: int) -> None:
+    """(Re)embed a flashcard from its front/back/topic/deck. Never raises."""
+    r = store.query_one("SELECT front,back,topic,deck FROM cards WHERE id=?", (cid,))
+    if r:
+        txt = " ".join(str(r.get(k) or "") for k in ("front", "back", "topic", "deck"))
+        semantic.index_row(store, "iprep_cards_vec", cid, txt)
+
 KNOWN_PATTERNS = [
     "two-pointers", "sliding-window", "binary-search", "bfs", "dfs", "backtracking",
     "dynamic-programming", "greedy", "heap", "stack", "linked-list", "tree", "trie",
@@ -95,6 +116,7 @@ def _add_card(front: str, back: str, topic: str = "", deck: str = "") -> dict:
     n = _now().isoformat()
     cid = store.execute("INSERT INTO cards(front,back,topic,deck,due_at,created_at,state) VALUES(?,?,?,?,?,?,'new')",
                         (front, back, topic.strip(), deck.strip(), n, n))
+    _reindex_card(cid)
     return {"id": cid}
 
 
@@ -264,6 +286,7 @@ def add_problem(title: str, difficulty: str = "", topic: str = "", url: str = ""
         diff = difficulty.strip()
     pid = store.execute("INSERT INTO problems(title,url,difficulty,topic,pattern,created_at) VALUES(?,?,?,?,?,?)",
                         (title, url, diff, topic, pattern.strip().lower(), _now().isoformat()))
+    _reindex_problem(pid)
     return {"id": pid, "title": title}
 
 
@@ -302,6 +325,7 @@ def tag_problem(problem_id: int, pattern: str = "", difficulty: str = "", topic:
         return {"error": "nothing to update"}
     params.append(problem_id)
     store.execute(f"UPDATE problems SET {','.join(sets)} WHERE id=?", params)
+    _reindex_problem(problem_id)
     return {"ok": True, "id": problem_id}
 
 
@@ -358,6 +382,83 @@ def problems_due(limit: int = 20) -> list[dict]:
     return store.query("SELECT id,title,difficulty,pattern,due_at FROM problems "
                        "WHERE due_at IS NOT NULL AND due_at<=? ORDER BY due_at ASC LIMIT ?",
                        (_now().isoformat(), max(1, limit)))
+
+
+# ---------------- Semantic search over problems ----------------
+def _problem_search_text(problem_id: int) -> str:
+    """Build the query text for a stored problem id (used when a problem id is passed in)."""
+    r = store.query_one("SELECT title,pattern,topic,difficulty FROM problems WHERE id=?", (problem_id,))
+    if not r:
+        return ""
+    return " ".join(str(r.get(k) or "") for k in ("title", "pattern", "topic", "difficulty"))
+
+
+@mcp.tool
+def find_similar_problems(query_or_problem_id, limit: int = 10) -> list[dict]:
+    """Find DSA problems similar to a free-text query OR to an existing problem (pass its id).
+    Hybrid: keyword (LIKE over title/pattern/topic) fused with semantic vector similarity, so
+    'find the longest substring without repeats' surfaces sliding-window problems even without
+    the exact words. Keyword-only fallback when no embedding model is installed. When a problem
+    id is given, that problem itself is excluded from the results."""
+    exclude_id = None
+    q = ""
+    if isinstance(query_or_problem_id, bool):
+        # bool is a subclass of int — treat as bad input rather than a row id.
+        return []
+    if isinstance(query_or_problem_id, int):
+        exclude_id = query_or_problem_id
+        q = _problem_search_text(query_or_problem_id)
+        if not q:
+            return [not_found("problem", query_or_problem_id, available=_recent_ids("problems"),
+                              hint="use list_problems()")]
+    else:
+        try:
+            q = str(query_or_problem_id or "").strip()
+        except Exception:
+            q = ""
+        # A bare numeric string is treated as a problem id, mirroring weak-agent calling.
+        if q.isdigit():
+            exclude_id = int(q)
+            txt = _problem_search_text(exclude_id)
+            if not txt:
+                return [not_found("problem", exclude_id, available=_recent_ids("problems"),
+                                  hint="use list_problems()")]
+            q = txt
+    if not q:
+        return []
+    like = f"%{q}%"
+    kw = [r["id"] for r in store.query(
+        "SELECT id FROM problems WHERE title LIKE ? OR pattern LIKE ? OR topic LIKE ? "
+        "ORDER BY created_at DESC LIMIT 50", (like, like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "iprep_problems_vec", q, limit=50)]
+    ids = semantic.rrf(kw, vec, max(1, limit) + (1 if exclude_id else 0)) if vec \
+        else kw[:max(1, limit) + (1 if exclude_id else 0)]
+    if exclude_id is not None:
+        ids = [i for i in ids if i != exclude_id]
+    ids = ids[:max(1, limit)]
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,title,difficulty,topic,pattern,status,attempts FROM problems WHERE id IN ({ph})",
+        tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all problems and flashcards. Needs a local embedding
+    model (uv sync --group embed). Safe to call repeatedly; degrades gracefully if no model."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable", "hint": "uv sync --group embed then call again"}
+    n_p = n_c = 0
+    for r in store.query("SELECT id FROM problems"):
+        _reindex_problem(r["id"])
+        n_p += 1
+    for r in store.query("SELECT id FROM cards"):
+        _reindex_card(r["id"])
+        n_c += 1
+    return {"ok": True, "indexed": n_p + n_c, "problems": n_p, "cards": n_c}
 
 
 # ---------------- Mock interviews ----------------

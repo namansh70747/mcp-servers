@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, data_dir, db_path, make_server
+from mcp_base import BaseStore, data_dir, db_path, make_server, not_found, semantic
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILE = ROOT / "profile.json"
@@ -54,8 +54,28 @@ CREATE TABLE IF NOT EXISTS drafts(
 );
 """
 store = BaseStore(db_path("blog-drafter"), schema=SCHEMA)
+store.migrate(semantic.vec_table_sql("blog_vec"))
 OUT = data_dir("blog-drafter") / "output"
 OUT.mkdir(parents=True, exist_ok=True)
+
+
+def _reindex(draft_id: int) -> None:
+    """(Re)build the semantic vector for a draft from its title/topic/tags/body. No-op without a model."""
+    d = store.query_one("SELECT title,topic,tags,body FROM drafts WHERE id=?", (draft_id,))
+    if d:
+        txt = " ".join(str(d.get(k) or "") for k in ("title", "topic", "tags", "body"))
+        semantic.index_row(store, "blog_vec", draft_id, txt)
+
+
+def _draft_ids(limit: int = 10) -> list[int]:
+    """Recent draft ids, to suggest valid targets in not-found errors."""
+    return [r["id"] for r in store.query(
+        "SELECT id FROM drafts ORDER BY updated_at DESC LIMIT ?", (limit,))]
+
+
+def _no_draft(draft_id) -> dict:
+    return not_found("draft", draft_id, available=_draft_ids(),
+                     hint="use list_drafts() or search() to find valid draft ids")
 
 # Additive migration: add metadata columns to existing DBs without data loss.
 _EXTRA_COLS = {
@@ -134,6 +154,7 @@ def outline_to_draft(topic: str, kind: str = "blog", title: str = "", author: st
     did = store.execute(
         "INSERT INTO drafts(title,kind,topic,body,author,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
         (t, kind, topic, body, byline, _now(), _now()))
+    _reindex(did)
     return {"id": did, "title": t, "kind": kind, "body": body, "author": byline}
 
 
@@ -145,6 +166,7 @@ def new_draft(title: str, body: str = "", kind: str = "blog", topic: str = "", a
     did = store.execute(
         "INSERT INTO drafts(title,kind,topic,body,author,updated_at,created_at) VALUES(?,?,?,?,?,?,?)",
         (title, kind, topic, body, byline, _now(), _now()))
+    _reindex(did)
     return {"id": did, "title": title}
 
 
@@ -152,6 +174,7 @@ def new_draft(title: str, body: str = "", kind: str = "blog", topic: str = "", a
 def save_draft(draft_id: int, body: str, status: str = "draft") -> dict:
     """Update a draft's body/status."""
     store.execute("UPDATE drafts SET body=?, status=?, updated_at=? WHERE id=?", (body, status, _now(), draft_id))
+    _reindex(draft_id)
     return {"ok": True, "id": draft_id}
 
 
@@ -181,6 +204,8 @@ def set_meta(draft_id: int, tags: list[str] | None = None, series: str = "",
     updates.append("updated_at=?"); params.append(_now())
     params.append(draft_id)
     store.execute(f"UPDATE drafts SET {', '.join(updates)} WHERE id=?", params)
+    if tags is not None:
+        _reindex(draft_id)  # tags are indexed; re-embed when they change
     return {"ok": True, "id": draft_id}
 
 
@@ -197,6 +222,62 @@ def list_drafts(kind: str = "", limit: int = 50) -> list[dict]:
 def get(draft_id: int) -> dict:
     """Get a full draft."""
     return store.query_one("SELECT * FROM drafts WHERE id=?", (draft_id,)) or {"error": "not found"}
+
+
+def _hydrate(ids: list[int]) -> list[dict]:
+    """Fetch draft summary rows by id, preserving the given id order."""
+    if not ids:
+        return []
+    ph = ",".join("?" * len(ids))
+    rows = {r["id"]: r for r in store.query(
+        f"SELECT id,title,kind,status,tags,updated_at FROM drafts WHERE id IN ({ph})", tuple(ids))}
+    return [rows[i] for i in ids if i in rows]
+
+
+@mcp.tool
+def search(query: str, limit: int = 15) -> list[dict]:
+    """Hybrid search across draft title/topic/tags/body: keyword (LIKE) fused with semantic vector
+    similarity via reciprocal-rank fusion (so 'retry with backoff' finds a relevant draft even without
+    those exact words). Keyword-only fallback when no embedding model is installed. Returns [] on an
+    empty query. Draft-only — surfaces your own drafts, never publishes."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    limit = max(1, limit)
+    like = f"%{q}%"
+    fts = [r["id"] for r in store.query(
+        "SELECT id FROM drafts WHERE title LIKE ? OR topic LIKE ? OR tags LIKE ? OR body LIKE ? "
+        "ORDER BY updated_at DESC LIMIT 50", (like, like, like, like))]
+    vec = [rid for rid, _ in semantic.vector_hits(store, "blog_vec", q, limit=50)]
+    ids = semantic.rrf(fts, vec, limit) if vec else fts[:limit]
+    return _hydrate(ids)
+
+
+@mcp.tool
+def find_similar(draft_id: int, limit: int = 8) -> list[dict]:
+    """Find drafts semantically related to a given draft (by meaning, not just shared words).
+    Needs a local embedding model; returns [] (no error) when none is installed or nothing is similar."""
+    d = store.query_one("SELECT id,title,topic,tags,body FROM drafts WHERE id=?", (draft_id,))
+    if not d:
+        return [_no_draft(draft_id)]
+    seed = " ".join(str(d.get(k) or "") for k in ("title", "topic", "tags", "body"))
+    hits = semantic.vector_hits(store, "blog_vec", seed, limit=max(1, limit) + 1)
+    ids = [rid for rid, _ in hits if rid != d["id"]][:max(1, limit)]
+    return _hydrate(ids)
+
+
+@mcp.tool
+def reindex_semantic() -> dict:
+    """(Re)build semantic embeddings for all drafts so search/find_similar use vector ranking. Needs a
+    local model (uv sync --group embed); reports unavailable otherwise."""
+    if not semantic.available():
+        return {"ok": False, "engine": "unavailable",
+                "hint": "uv sync --group embed (model2vec, free, ~30MB) then call again"}
+    n = 0
+    for r in store.query("SELECT id FROM drafts"):
+        _reindex(r["id"])
+        n += 1
+    return {"ok": True, "indexed": n}
 
 
 @mcp.tool

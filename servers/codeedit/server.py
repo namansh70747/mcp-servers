@@ -46,11 +46,24 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 # Path safety
 # --------------------------------------------------------------------------- #
 def _root(repo: str | None = None) -> Path:
-    return Path(repo).expanduser().resolve() if repo else Path.cwd().resolve()
+    if repo:
+        if not isinstance(repo, str) or not repo.strip() or "\x00" in repo:
+            raise ValueError(f"invalid repo: {repo!r}")
+        return Path(repo).expanduser().resolve()
+    return Path.cwd().resolve()
 
 
 def _safe_path(path: str, repo: str | None = None) -> Path:
-    """Resolve `path` and confine it under the root. Raises ValueError on escape."""
+    """Resolve `path` and confine it under the root. Raises ValueError on bad input or escape.
+
+    Rejects non-string, empty/whitespace, and NUL-containing paths so garbage/None inputs
+    surface as a caught ValueError (handled by every tool) instead of crashing."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"invalid path: {path!r}")
+    if "\x00" in path:
+        raise ValueError("invalid path: contains NUL byte")
+    if repo is not None and not isinstance(repo, str):
+        raise ValueError(f"invalid repo: {repo!r}")
     root = _root(repo)
     p = Path(path).expanduser()
     full = (p if p.is_absolute() else (root / p)).resolve()
@@ -618,6 +631,174 @@ def list_backups(path: str, repo: str | None = None) -> dict:
               "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(b.stat().st_mtime))}
              for b in backups]
     return ok(path=str(full), count=len(items), backups=items)
+
+
+# --------------------------------------------------------------------------- #
+# Quality metrics (read-only, language-aware, never raises)
+# --------------------------------------------------------------------------- #
+# Per-extension single-line comment markers.
+_LINE_COMMENT = {
+    ".py": ("#",), ".rb": ("#",), ".sh": ("#",), ".pl": ("#",), ".r": ("#",),
+    ".yaml": ("#",), ".yml": ("#",), ".toml": ("#",),
+    ".js": ("//",), ".jsx": ("//",), ".mjs": ("//",), ".cjs": ("//",),
+    ".ts": ("//",), ".tsx": ("//",), ".go": ("//",), ".rs": ("//",),
+    ".java": ("//",), ".c": ("//",), ".h": ("//",), ".cpp": ("//",),
+    ".cc": ("//",), ".hpp": ("//",), ".cs": ("//",), ".swift": ("//",),
+    ".kt": ("//",), ".php": ("//", "#"),
+    ".sql": ("--",), ".lua": ("--",), ".hs": ("--",),
+}
+
+# Branch / control-flow keywords used as a crude cyclomatic-complexity proxy.
+_BRANCH_KEYWORDS = (
+    "if", "elif", "else if", "else", "for", "while", "case", "catch",
+    "except", "switch", "&&", "||", "?", "and", "or",
+)
+
+
+def _branch_complexity(text: str) -> int:
+    """Count branch/control-flow keyword occurrences as a simple complexity heuristic.
+
+    Word-boundary matched for alphabetic keywords; substring matched for operators."""
+    import re
+
+    total = 0
+    for kw in _BRANCH_KEYWORDS:
+        if kw[0].isalpha():
+            total += len(re.findall(r"\b" + re.escape(kw) + r"\b", text))
+        else:
+            total += text.count(kw)
+    return total
+
+
+def _python_func_lengths(text: str) -> list[dict]:
+    """Return [{name, start, end, length}] for each top-level/nested def/async def via AST."""
+    import ast
+
+    try:
+        tree = ast.parse(text)
+    except Exception:  # noqa: BLE001 — syntax errors must not crash metrics
+        return []
+    funcs: list[dict] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = node.lineno
+            end = getattr(node, "end_lineno", None) or start
+            funcs.append({"name": node.name, "start": start, "end": end,
+                          "length": end - start + 1})
+    return funcs
+
+
+def _braced_func_lengths(text: str) -> list[dict]:
+    """Heuristic longest-function detection for C-family / brace languages.
+
+    Tracks the span between a likely function-opening line and the brace that closes it."""
+    import re
+
+    lines = text.splitlines()
+    sig = re.compile(r"[A-Za-z_][\w<>:\*&\s,]*\([^;{]*\)\s*\{?\s*$")
+    funcs: list[dict] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        # A function-ish signature line that opens (or is about to open) a block.
+        if sig.search(stripped) and "{" in (stripped + (lines[i + 1] if i + 1 < n else "")):
+            start = i + 1  # 1-based
+            depth = 0
+            seen = False
+            j = i
+            while j < n:
+                depth += lines[j].count("{") - lines[j].count("}")
+                if "{" in lines[j]:
+                    seen = True
+                if seen and depth <= 0:
+                    break
+                j += 1
+            end = min(j + 1, n)  # 1-based
+            if end > start:
+                funcs.append({"name": stripped[:60], "start": start, "end": end,
+                              "length": end - start + 1})
+            i = j + 1
+            continue
+        i += 1
+    return funcs
+
+
+def _quality_metrics(full: Path) -> dict:
+    """Compute read-only quality metrics for a file. Never raises; returns a plain dict."""
+    if not full.exists():
+        return {"exists": False, "error": "file does not exist"}
+    if full.is_dir():
+        return {"exists": False, "error": "path is a directory, not a file"}
+    try:
+        text = full.read_text(encoding="utf-8", errors="replace")
+    except Exception as ex:  # noqa: BLE001
+        return {"exists": True, "error": f"could not read file: {ex}"}
+
+    ext = full.suffix.lower()
+    lines = text.splitlines()
+    total_lines = len(lines)
+    blank = sum(1 for ln in lines if not ln.strip())
+    markers = _LINE_COMMENT.get(ext, ("#",))
+    comment = 0
+    for ln in lines:
+        s = ln.strip()
+        if s and any(s.startswith(m) for m in markers):
+            comment += 1
+    code = total_lines - blank - comment
+    # TODO/FIXME/XXX/HACK markers (case-insensitive).
+    import re
+
+    todo = len(re.findall(r"\b(?:TODO|FIXME|XXX|HACK)\b", text, flags=re.IGNORECASE))
+
+    if ext == ".py":
+        funcs = _python_func_lengths(text)
+        func_method = "ast"
+    elif ext in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs",
+                 ".java", ".c", ".h", ".cpp", ".cc", ".hpp", ".cs", ".swift", ".kt"):
+        funcs = _braced_func_lengths(text)
+        func_method = "brace-heuristic"
+    else:
+        funcs = []
+        func_method = "unsupported"
+
+    longest = max((f["length"] for f in funcs), default=0)
+    longest_func = max(funcs, key=lambda f: f["length"], default=None) if funcs else None
+
+    return {
+        "exists": True,
+        "ext": ext or "(none)",
+        "loc": total_lines,
+        "code_lines": code,
+        "comment_lines": comment,
+        "blank_lines": blank,
+        "comment_ratio": round(comment / total_lines, 4) if total_lines else 0.0,
+        "todo_fixme_count": todo,
+        "function_count": len(funcs),
+        "function_method": func_method,
+        "longest_function_length": longest,
+        "longest_function": longest_func,
+        "branch_keyword_count": _branch_complexity(text),
+    }
+
+
+@mcp.tool
+def quality_metrics(path: str, repo: str | None = None) -> dict:
+    """Read-only code-quality snapshot for a file. NEVER raises (returns err on bad/missing input).
+
+    Reports LOC (total lines), code/comment/blank line counts, comment ratio, TODO/FIXME count,
+    longest-function length (Python via AST; C-family via a brace heuristic), and a simple
+    complexity heuristic (count of branch/control-flow keywords like if/for/while/&&/||).
+    Unsupported extensions still get LOC + comment + TODO metrics (function length = 0)."""
+    try:
+        full = _safe_path(path, repo)
+    except ValueError as e:
+        return err(str(e))
+    m = _quality_metrics(full)
+    if not m.get("exists"):
+        return err(f"quality_metrics: {m.get('error', 'unavailable')}", path=str(full))
+    return ok(path=str(full), **{k: v for k, v in m.items() if k != "exists"})
 
 
 # --------------------------------------------------------------------------- #

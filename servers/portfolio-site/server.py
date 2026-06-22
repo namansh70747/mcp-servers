@@ -8,9 +8,8 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-import httpx
 from jinja2 import Template
-from mcp_base import data_dir, get_env, make_server
+from mcp_base import data_dir, get_env, http, make_server
 
 # GitHub usernames: alphanumeric or single hyphens, 1-39 chars.
 _USER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
@@ -187,19 +186,13 @@ def projects_from_github(username: str, limit: int = 6) -> dict:
     stars). Free GitHub REST; uses PAT if set. Returns an error dict offline/rate-limited."""
     if not isinstance(username, str) or not _USER_RE.match(username):
         return {"error": "invalid username (1-39 chars: letters, digits, hyphens)"}
-    try:
-        r = httpx.get(f"https://api.github.com/users/{username}/repos",
-                      headers=_gh_headers(), params={"per_page": 100, "sort": "updated"}, timeout=25)
-    except Exception as e:  # noqa: BLE001
-        return {"error": f"request failed: {e}"}
-    if r.status_code != 200:
-        return {"error": f"github {r.status_code}", "hint": "set GITHUB_PERSONAL_ACCESS_TOKEN for limits"}
-    if len(r.content) > 8 * 1024 * 1024:
-        return {"error": "response too large"}
-    try:
-        payload = r.json()
-    except Exception:  # noqa: BLE001
-        return {"error": "invalid json from github"}
+    r = http.request("GET", f"https://api.github.com/users/{username}/repos",
+                     headers=_gh_headers(), params={"per_page": 100, "sort": "updated"},
+                     timeout=25, cache_ttl=300.0)
+    if not r.get("ok"):
+        return {"error": f"github {r.get('status') or r.get('error')}",
+                "hint": "set GITHUB_PERSONAL_ACCESS_TOKEN for limits"}
+    payload = r.get("json")
     if not isinstance(payload, list):
         return {"error": "unexpected github response"}
     repos = sorted([x for x in payload if not x.get("fork")],
@@ -261,6 +254,37 @@ def deploy_instructions(repo: str = "", branch: str = "gh-pages") -> dict:
                   "git push -u origin main"]
     return {"site_dir": site, "branch": branch, "steps": steps,
             "note": "A .nojekyll file is written so Pages serves the static HTML as-is."}
+
+
+@mcp.tool
+def deploy_vercel() -> dict:
+    """Prepare a free Vercel deploy of the generated site: writes a static vercel.json into the site
+    dir and returns the deploy commands. No secrets; you run the commands."""
+    site = OUT
+    if not (site / "index.html").exists():
+        return {"error": "no site built yet", "hint": "run build_site() first"}
+    try:
+        (site / "vercel.json").write_text(json.dumps(
+            {"$schema": "https://openapi.vercel.sh/vercel.json", "cleanUrls": True,
+             "trailingSlash": False}, indent=2))
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"could not write vercel.json: {e}"}
+    return {"site_dir": str(site),
+            "steps": [f"cd {site}", "npx vercel --yes            # preview deploy (first run logs you in)",
+                      "npx vercel --prod --yes      # production deploy"],
+            "note": "vercel.json written (clean URLs). Free Hobby tier; no config/secrets needed here."}
+
+
+@mcp.tool
+def deploy_netlify() -> dict:
+    """Prepare a free Netlify deploy: returns the netlify-cli commands to publish the generated site."""
+    site = OUT
+    if not (site / "index.html").exists():
+        return {"error": "no site built yet", "hint": "run build_site() first"}
+    return {"site_dir": str(site),
+            "steps": [f"cd {site}", "npx netlify-cli deploy --dir . ",
+                      "npx netlify-cli deploy --dir . --prod   # production"],
+            "note": "Free tier. Drag-and-drop at app.netlify.com/drop also works with this folder."}
 
 
 if __name__ == "__main__":

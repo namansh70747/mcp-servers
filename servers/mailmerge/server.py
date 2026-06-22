@@ -421,5 +421,141 @@ def campaign_advice(sendable: int, daily_cap: int = 20, cooldown_days: int = 14)
     }
 
 
+def _strip_subject_prefix(s: str) -> str:
+    """Drop a leading 'Subject:' label if present; return the bare subject line."""
+    s = (s or "").strip()
+    if s.lower().startswith("subject:"):
+        s = s.split(":", 1)[1].strip()
+    # collapse to a single line + squeeze internal whitespace
+    return re.sub(r"\s+", " ", s.splitlines()[0].strip()) if s else ""
+
+
+@mcp.tool
+def ab_subjects(subject: str, n: int = 3) -> dict:
+    """Generate labeled A/B subject-line variants from a base subject (analysis/draft only — never sends).
+
+    Returns up to `n` deterministically-derived variants (A, B, C, ...), each with a short rationale and
+    a heuristic length flag, so you can pick the strongest line for reachout. Offline; never raises."""
+    base = _strip_subject_prefix(subject)
+    if not base:
+        return {"error": "subject is required", "variants": []}
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 3
+    n = max(1, min(n, 6))
+
+    words = base.split()
+    first_word = words[0] if words else base
+
+    def _flags(text: str) -> dict:
+        chars = len(text)
+        return {
+            "char_count": chars,
+            "word_count": len(text.split()),
+            # ~ <50 chars renders without truncation in most inbox previews
+            "length_ok": chars <= 50,
+            "too_long": chars > 70,
+        }
+
+    # Deterministic, no-LLM heuristics. Each is a distinct, defensible angle.
+    candidates: list[tuple[str, str]] = [
+        (base, "control / original"),
+        (base.lower() if base != base.lower() else base,
+         "lowercase, casual tone (often feels more personal, less 'marketing')"),
+        (f"Quick question: {first_word.lower()}..." if first_word else base,
+         "curiosity-gap opener (drives opens; pair with a relevant body)"),
+        (re.sub(r"[.!?…]+$", "", base),
+         "punctuation-trimmed, plain statement"),
+        (f"{base} ({datetime.now(timezone.utc).strftime('%b')})" if len(base) <= 55 else base,
+         "timeliness cue with current month"),
+        (" ".join(words[:6]) + ("…" if len(words) > 6 else ""),
+         "shortened to first 6 words for mobile previews"),
+    ]
+
+    variants, seen = [], set()
+    labels = "ABCDEF"
+    for text, why in candidates:
+        text = _strip_subject_prefix(text)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append({
+            "label": labels[len(variants)],
+            "subject": text,
+            "rationale": why,
+            **_flags(text),
+        })
+        if len(variants) >= n:
+            break
+
+    return {
+        "base": base,
+        "count": len(variants),
+        "variants": variants,
+        "advice": "Send variant A to a holdout and one alternative to a matched group; keep the body "
+                  "identical so the subject is the only changed variable. Pick the winner by open rate, "
+                  "then standardize. Aim for <= 50 chars so the line isn't truncated in inbox previews.",
+        "note": "Draft/analysis only — mailmerge never sends. Hand the chosen subject to reachout.",
+    }
+
+
+# Heuristic best-send windows (local time at the recipient). Tuesday-Thursday mid-morning and
+# early afternoon are the broadly-cited cold-outreach sweet spots; Monday AM and Fri PM are weak.
+_SEND_WINDOWS = [
+    {"day": "Tue", "start": "09:30", "end": "11:00", "tier": "best",
+     "why": "Mid-morning Tue/Wed/Thu is the classic cold-email peak"},
+    {"day": "Wed", "start": "09:30", "end": "11:00", "tier": "best",
+     "why": "Mid-morning Tue/Wed/Thu is the classic cold-email peak"},
+    {"day": "Thu", "start": "09:30", "end": "11:00", "tier": "best",
+     "why": "Mid-morning Tue/Wed/Thu is the classic cold-email peak"},
+    {"day": "Tue", "start": "13:30", "end": "15:00", "tier": "good",
+     "why": "Early afternoon, post-lunch inbox triage"},
+    {"day": "Wed", "start": "13:30", "end": "15:00", "tier": "good",
+     "why": "Early afternoon, post-lunch inbox triage"},
+    {"day": "Thu", "start": "13:30", "end": "15:00", "tier": "good",
+     "why": "Early afternoon, post-lunch inbox triage"},
+    {"day": "Mon", "start": "10:00", "end": "11:30", "tier": "ok",
+     "why": "After the Monday backlog clears; avoid the early-AM flood"},
+]
+
+_AVOID_WINDOWS = [
+    "Before 08:00 and after 18:00 local (off-hours look automated)",
+    "Monday before 10:00 (buried under weekend backlog)",
+    "Friday after 14:00 and all weekend (low engagement)",
+    "Lunch hour ~12:00-13:00 local",
+]
+
+
+@mcp.tool
+def send_time_suggestion(timezone: str = "") -> dict:
+    """Heuristic best send-time windows for cold outreach (analysis only — never schedules or sends).
+
+    Returns ranked day/time windows in the recipient's LOCAL time, plus windows to avoid. `timezone` is
+    a free-text label (e.g. 'America/New_York', 'PT', 'recipient local') echoed back for context; no
+    network, no tz math — pure guidance. Never raises."""
+    tz = (timezone or "").strip() or "recipient local"
+    best = [w for w in _SEND_WINDOWS if w["tier"] == "best"]
+    return {
+        "timezone": tz,
+        "basis": "local time at the recipient",
+        "windows": list(_SEND_WINDOWS),
+        "top_pick": {
+            "day": "Tue/Wed/Thu",
+            "window": "09:30-11:00",
+            "why": best[0]["why"] if best else "mid-morning midweek",
+        },
+        "avoid": list(_AVOID_WINDOWS),
+        "advice": "Schedule in the recipient's local timezone, not yours. Randomize the exact minute "
+                  "within a window so sends don't look batched, and keep daily volume under your cap "
+                  "(see throttle_plan). These are heuristics, not guarantees — test against your own "
+                  "open-rate data.",
+        "note": "Draft/analysis only — mailmerge never schedules or sends. Use reachout to act on this.",
+    }
+
+
 if __name__ == "__main__":
     mcp.run()

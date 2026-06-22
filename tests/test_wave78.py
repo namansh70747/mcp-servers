@@ -1,8 +1,13 @@
 """Wave 7 (offline) + Wave 8 (live macOS/brew) smoke tests."""
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 
+# Isolate runtime data in a throwaway dir BEFORE importing any server, so exact-count assertions
+# (e.g. time-tracker total_hours) aren't perturbed by residual rows in the real ~/.mcp-suite.
+os.environ["MCP_DATA_DIR"] = tempfile.mkdtemp(prefix="wave78-")
 ROOT = Path(__file__).resolve().parents[1]
 from fastmcp import Client  # noqa: E402
 

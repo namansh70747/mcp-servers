@@ -56,6 +56,16 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _as_dict(v) -> dict:
+    """Coerce arbitrary input to a string-keyed dict (fuzzer may pass None/list/str)."""
+    return v if isinstance(v, dict) else {}
+
+
+def _as_list(v) -> list:
+    """Coerce arbitrary input to a list (fuzzer may pass None/dict/str)."""
+    return v if isinstance(v, list) else []
+
+
 _MAX_LIMIT = 500  # clamp for unbounded list/history queries
 
 
@@ -146,16 +156,21 @@ _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
 def _do(method, url, headers, body, *, env=None, auth_type="", auth_value="",
         assertions=None, timeout=30) -> dict:
-    env = env or {}
-    if (method or "").upper() not in _ALLOWED_METHODS:
+    env = _as_dict(env)
+    if not isinstance(method, str) or method.upper() not in _ALLOWED_METHODS:
         return {"error": f"unsupported HTTP method: {method!r}"}
-    timeout = max(1, min(int(timeout or 30), 120))
+    try:
+        timeout = max(1, min(int(timeout or 30), 120))
+    except (TypeError, ValueError):
+        timeout = 30
+    if not isinstance(url, str):
+        return {"error": "url must be a string"}
     url = _subst(url, env)
     if not (url or "").strip():
         return {"error": "url is required"}
     if not (url.startswith("http://") or url.startswith("https://")):
         return {"error": "url must start with http:// or https://"}
-    headers = {k: _subst(str(v), env) for k, v in (headers or {}).items()}
+    headers = {str(k): _subst(str(v), env) for k, v in _as_dict(headers).items()}
     headers = _apply_auth(headers, auth_type, auth_value, env)
     body = _subst(body, env) if body else body
     try:
@@ -194,9 +209,10 @@ def _add_request(name: str, url: str, method: str = "GET", headers: dict | None 
     rid = store.execute(
         "INSERT INTO requests(name,collection,method,url,headers,body,auth_type,auth_value,"
         "assertions,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (name, collection, method, url, json.dumps(headers or {}), body, auth_type, auth_value,
-         json.dumps(assertions or []), _now(), _now()))
-    return {"id": rid, "name": name, "collection": collection}
+        (name, collection or "default", method, url, json.dumps(_as_dict(headers)),
+         body or "", auth_type or "", auth_value or "",
+         json.dumps(_as_list(assertions)), _now(), _now()))
+    return {"id": rid, "name": name, "collection": collection or "default"}
 
 
 @mcp.tool
@@ -314,9 +330,10 @@ def set_assertions(request_id: int, assertions: list) -> dict:
     {"type":"json","path":"data.0.id","equals":5}, {"type":"latency","max_ms":500}."""
     if not store.query_one("SELECT id FROM requests WHERE id=?", (request_id,)):
         return {"error": "not found"}
+    specs = _as_list(assertions)
     store.execute("UPDATE requests SET assertions=?, updated_at=? WHERE id=?",
-                  (json.dumps(assertions), _now(), request_id))
-    return {"ok": True, "id": request_id, "count": len(assertions)}
+                  (json.dumps(specs), _now(), request_id))
+    return {"ok": True, "id": request_id, "count": len(specs)}
 
 
 def _parse_curl(command: str) -> dict:
@@ -388,29 +405,41 @@ def import_openapi(spec: str, collection: str = "", limit: int = 100) -> dict:
     """Import an OpenAPI/Swagger JSON spec (file path or URL) — creates a saved request per operation.
 
     JSON specs only (no YAML). Builds full URLs from the first server/host entry."""
+    spec = (spec or "").strip()
+    if not spec:
+        return {"error": "spec is required (file path or URL)"}
     raw = ""
     if spec.startswith("http://") or spec.startswith("https://"):
-        resp = http.request("GET", spec, timeout=30)
+        # Plain spec fetch -> route through the shared hardened HTTP helper
+        # (retry/backoff + SSRF guard + caching). The arbitrary-method request
+        # runner (_do / save_response) intentionally stays on raw httpx.
+        resp = http.request("GET", spec, timeout=30, cache_ttl=300.0)
         if not resp.get("ok"):
             return {"error": f"fetch failed: {resp.get('error') or ('HTTP ' + str(resp.get('status')))}"}
         raw = resp.get("text", "")
     else:
-        p = Path(spec).expanduser()
-        if not p.is_file():
-            return {"error": f"no such file: {spec}"}
-        raw = p.read_text(encoding="utf-8")
+        try:
+            p = Path(spec).expanduser()
+            if not p.is_file():
+                return {"error": f"no such file: {spec}"}
+            raw = p.read_text(encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — bad path / permission / encoding
+            return {"error": f"could not read spec file: {e}"}
     try:
         doc = json.loads(raw)
     except json.JSONDecodeError as e:
         return {"error": f"not valid JSON (YAML is unsupported): {e}"}
+    if not isinstance(doc, dict):
+        return {"error": "spec must be a JSON object (OpenAPI/Swagger document)"}
 
+    limit = _clamp_limit(limit, default=100)
     base = ""
     if doc.get("servers"):
-        base = (doc["servers"][0] or {}).get("url", "").rstrip("/")
+        base = ((doc["servers"][0] or {}).get("url", "") or "").rstrip("/")
     elif doc.get("host"):
         scheme = (doc.get("schemes") or ["https"])[0]
-        base = f"{scheme}://{doc['host']}{doc.get('basePath', '').rstrip('/')}"
-    coll = collection or (doc.get("info", {}).get("title") or "openapi").strip() or "openapi"
+        base = f"{scheme}://{doc['host']}{(doc.get('basePath') or '').rstrip('/')}"
+    coll = collection or ((doc.get("info") or {}).get("title") or "openapi").strip() or "openapi"
 
     created, methods = [], {"get", "post", "put", "patch", "delete", "head", "options"}
     for path, ops in (doc.get("paths") or {}).items():
@@ -442,6 +471,104 @@ def history(request_id: int = 0, limit: int = 50) -> list[dict]:
     return store.query(
         "SELECT id,request_id,name,method,url,status,ok,elapsed_ms,passed,ran_at FROM history "
         "ORDER BY id DESC LIMIT ?", (limit,))
+
+
+@mcp.tool
+def replay(history_id: int, env: str = "default") -> dict:
+    """Re-run a request captured in run history.
+
+    If the originating saved request still exists it is re-run by its *current*
+    definition (env substitution + auth + assertions), so the replay reflects any
+    edits since. If that request was deleted (or it was an ad-hoc run), the bare
+    method+URL recorded in history is replayed instead (no auth/assertions)."""
+    try:
+        hid = int(history_id)
+    except (TypeError, ValueError):
+        return {"error": "history_id must be an integer"}
+    h = store.query_one(
+        "SELECT id,request_id,name,method,url FROM history WHERE id=?", (hid,))
+    if not h:
+        avail = [r["id"] for r in store.query(
+            "SELECT id FROM history ORDER BY id DESC LIMIT 10")]
+        return {"error": f"no history entry '{hid}'", "available": avail,
+                "hint": "use history() to list recent runs"}
+
+    rid = h.get("request_id")
+    r = store.query_one("SELECT * FROM requests WHERE id=?", (rid,)) if rid else None
+    em = _env_map(env)
+    if r:
+        resp = _do(r["method"], r["url"], json.loads(r["headers"] or "{}"), r["body"],
+                   env=em, auth_type=r.get("auth_type", ""),
+                   auth_value=r.get("auth_value", ""),
+                   assertions=json.loads(r.get("assertions") or "[]"))
+        name = r["name"]
+        if "error" not in resp:
+            _record(rid, name, r["method"], resp.get("request_url", r["url"]), resp)
+        return {"replayed_history_id": hid, "request_id": rid, "request": name,
+                "source": "saved_request", **resp}
+
+    # Saved request is gone (or was an inline run): replay the recorded snapshot.
+    method = h.get("method") or "GET"
+    url = h.get("url") or ""
+    resp = _do(method, url, {}, "", env=em)
+    name = h.get("name") or url
+    if "error" not in resp:
+        _record(rid or None, name, method, resp.get("request_url", url), resp)
+    return {"replayed_history_id": hid, "request_id": rid, "request": name,
+            "source": "history_snapshot", **resp}
+
+
+@mcp.tool
+def export_collection(name: str = "") -> dict:
+    """Export a collection to a ready-to-paste JSON document of its saved requests.
+
+    Pass a collection name, or leave empty to export every collection. The returned
+    `json` string round-trips: each request includes name/method/url/headers/body/
+    auth/assertions so it can be re-imported or shared. Env vars are NOT included
+    (they may hold secrets) — only `{{VAR}}` placeholders are preserved verbatim."""
+    coll = (name or "").strip()
+    if coll:
+        rows = store.query("SELECT * FROM requests WHERE collection=? ORDER BY id", (coll,))
+        if not rows:
+            avail = [r["collection"] for r in store.query(
+                "SELECT DISTINCT collection FROM requests ORDER BY collection")]
+            return {"error": f"no collection '{coll}'", "available": avail,
+                    "hint": "use list_requests() to see saved requests"}
+    else:
+        rows = store.query("SELECT * FROM requests ORDER BY collection, id")
+
+    requests_out: list[dict] = []
+    for r in rows:
+        try:
+            headers = json.loads(r.get("headers") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            headers = {}
+        try:
+            assertions = json.loads(r.get("assertions") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            assertions = []
+        requests_out.append({
+            "name": r.get("name") or "",
+            "collection": r.get("collection") or "default",
+            "method": r.get("method") or "GET",
+            "url": r.get("url") or "",
+            "headers": headers,
+            "body": r.get("body") or "",
+            "auth_type": r.get("auth_type") or "",
+            "auth_value": r.get("auth_value") or "",
+            "assertions": assertions,
+        })
+
+    doc = {
+        "format": "api-tester/collection",
+        "version": 1,
+        "exported_at": _now(),
+        "collection": coll or "*",
+        "count": len(requests_out),
+        "requests": requests_out,
+    }
+    return {"ok": True, "collection": coll or "*", "count": len(requests_out),
+            "json": json.dumps(doc, indent=2), "requests": requests_out}
 
 
 @mcp.tool
