@@ -114,6 +114,21 @@ if (exists(serversDir)) {
   }
 }
 
+// ---------- Qwen hubs ----------
+// Qwen caps MCP entries (~5 servers). So Qwen ALONE gets the 5 aggregated hubs instead of the
+// individual servers — each hub is one process (runner/run-mcp-hub <name>) that mounts many
+// servers and re-exposes their tools under <server>_<tool> names. Every server stays reachable;
+// the hub membership lives in runner/mcp_runner/hubs.py. Every OTHER client keeps individual servers.
+const QWEN_HUBS = ["dev", "outreach", "career", "prod", "system"];
+// `--refresh-package` forces uvx to rebuild the local runner wheel from source on every launch
+// (it's tiny, so this is cheap) while keeping the heavy deps cached. Without it, uvx serves a
+// stale cached runner and edits to hubs.py (hub membership) silently don't take effect.
+const qwenHubEntry = (hub) => ({
+  command: UVX,
+  args: ["--refresh-package", "mcp-suite-runner", "--from", path.join(ROOT, "runner"), "run-mcp-hub", hub],
+  env: { MCP_SUITE_ROOT: ROOT },
+});
+
 // ---------- client registry ----------
 // secret: how this client expresses secrets
 //   ref-dollar -> ${VAR} | ref-env -> ${env:VAR} | inline -> literal from .env | vscode-input -> inputs[]
@@ -124,6 +139,7 @@ const CLIENTS = [
   { id: "cursor",         file: path.join(HOME, ".cursor/mcp.json"),                                                          key: "mcpServers",      secret: "ref-env",      schema: "mcpServers" },
   { id: "windsurf",       file: path.join(HOME, ".codeium/windsurf/mcp_config.json"),                                        key: "mcpServers",      secret: "ref-env",      schema: "mcpServers" },
   { id: "qwen",           file: path.join(HOME, ".qwen/settings.json"),                                                       key: "mcpServers",      secret: "ref-dollar",   schema: "mcpServers" },
+  { id: "qwen-desktop",  file: path.join(HOME, "Library/Application Support/Qwen/settings.json"),                              key: "mcp_config",      secret: "ref-dollar",   schema: "mcpServers" },
   { id: "kimi",           file: path.join(HOME, ".kimi/mcp.json"),                                                            key: "mcpServers",      secret: "inline",       schema: "mcpServers" },
   { id: "vscode",         file: path.join(HOME, "Library/Application Support/Code/User/mcp.json"),                            key: "servers",         secret: "vscode-input", schema: "vscode" },
   { id: "gemini",         file: path.join(HOME, ".gemini/settings.json"),                                                     key: "mcpServers",      secret: "ref-dollar",   schema: "mcpServers" },
@@ -198,10 +214,30 @@ for (const client of CLIENTS) {
   const inputs = [];
   const block = {};
   let count = 0;
-  for (const srv of servers) {
-    if (srv.exclude.includes(client.id)) continue;
-    block[srv.name] = buildEntry(client, srv, inputs);
-    count++;
+  if (client.id === "qwen-desktop") {
+    // Qwen Desktop caps MCP entries (~5). Write the 5 aggregated hubs.
+    // --refresh-package forces uvx to rebuild the local runner wheel from source on every launch
+    // so edits to hubs.py take effect immediately without manual reinstall.
+    for (const hub of QWEN_HUBS) {
+      const hubName = `${hub}-hub`;
+      block[hubName] = {
+        name: hubName,
+        command: UVX,
+        args: ["--refresh-package", "mcp-suite-runner", "--from", path.join(ROOT, "runner"), "run-mcp-hub", hub],
+        env: { MCP_SUITE_ROOT: ROOT },
+      };
+      count++;
+    }
+  } else {
+    // Every other client (incl. Qwen Code CLI — which has NO 5-server limit) gets all servers
+    // wired individually. Qwen CLI entries are marked trust:true so it doesn't prompt per-server.
+    for (const srv of servers) {
+      if (srv.exclude.includes(client.id)) continue;
+      const e = buildEntry(client, srv, inputs);
+      if (client.id === "qwen") e.trust = true;
+      block[srv.name] = e;
+      count++;
+    }
   }
 
   // merge into existing file (preserve unrelated settings)
