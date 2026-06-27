@@ -6,6 +6,7 @@ All functions are dependency-light (lazy httpx) and never raise — failures com
 from __future__ import annotations
 
 import ipaddress
+import os
 import threading
 import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -17,6 +18,34 @@ _TRACKING_PREFIXES = ("utm_", "mc_", "pk_")
 _TRACKING_KEYS = {"fbclid", "gclid", "gclsrc", "dclid", "msclkid", "ref", "ref_src", "ref_url",
                   "igshid", "yclid", "_hsenc", "_hsmi", "mkt_tok", "spm"}
 _DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+_CLIENT = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _client():
+    """Return (or lazily build) the shared long-lived httpx.Client for fetch operations.
+    Headers and cookies are always passed per-call to prevent cross-site leakage."""
+    global _CLIENT
+    if _CLIENT is None:
+        with _CLIENT_LOCK:
+            if _CLIENT is None:
+                import httpx
+                limits = httpx.Limits(
+                    max_keepalive_connections=int(os.getenv("HTTP_POOL_MAX_KEEPALIVE", "20")),
+                    max_connections=int(os.getenv("HTTP_POOL_MAX_CONNECTIONS", "100")),
+                    keepalive_expiry=float(os.getenv("HTTP_POOL_KEEPALIVE_EXPIRY", "30")),
+                )
+                kw: dict = {}
+                if os.getenv("HTTP_HTTP2", "0") == "1":
+                    try:
+                        import h2  # noqa: F401
+                        kw["http2"] = True
+                    except ImportError:
+                        pass
+                _CLIENT = httpx.Client(limits=limits, follow_redirects=True,
+                                       timeout=httpx.Timeout(20.0), **kw)
+    return _CLIENT
 
 
 def is_internal_host(host: str) -> bool:
@@ -81,10 +110,8 @@ def fetch(url: str, *, timeout: float = 20.0, cookies: dict | None = None, etag:
     last = ""
     for attempt in range(retries + 1):
         try:
-            import httpx
-            with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers,
-                              cookies=cookies or {}) as c:
-                r = c.get(full)
+            r = _client().get(full, headers=headers, cookies=cookies or {}, timeout=timeout,
+                              follow_redirects=True)
             if r.status_code == 304:
                 return {"ok": True, "not_modified": True, "status": 304, "final_url": full}
             if r.status_code in (408, 425, 429, 500, 502, 503, 504) and attempt < retries:
