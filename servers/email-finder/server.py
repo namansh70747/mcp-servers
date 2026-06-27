@@ -1263,13 +1263,15 @@ _REAL_PUBLISHED = {"site", "web", "github", "hunter-known", "wayback", "tomba", 
 _FINDER_SOURCES = {"tomba", "snov", "skrapp", "hunter-find", "prospeo", "getprospect", "minelead",
                    "emailverify_io", "generect", "hunter-known", "hunter-pattern"}  # name+domain→email
 _REVEAL_SOURCES = {"apollo-cdp", "extension", "apollo-search"}                    # authoritative reveals
-_PUBLISHED_SOURCES = {"site", "web", "github", "wayback", "harvest", "pgp", "crtsh", "deep_crawl"}
+_PUBLISHED_SOURCES = {"site", "web", "github", "wayback", "harvest", "pgp", "crtsh", "deep_crawl",
+                      "commoncrawl", "theharvester", "webscrape"}  # Stage-B sources added
 
 
 def _confirm_signals(sources, v: dict) -> list[str]:
     """List the INDEPENDENT strong confirmation signals backing an email — each distinct finder DB,
-    each distinct published source, a multi-verifier API verdict, and SMTP-250 / enumeration. Used by
-    the consensus policy: ≥2 distinct signals ⇒ a genuinely CONFIRMED (high-confidence) address."""
+    each distinct published source, a multi-verifier API verdict, SMTP-250 / enumeration, and F7 Bayes
+    fusion across all available signals. Used by the consensus policy: ≥2 distinct signals ⇒ confirmed.
+    Bayes counts as one signal when probability ≥ 0.65 (never downgrades a direct smtp-250/api hit)."""
     sigs: list[str] = []
     srcs = set(sources or [])
     for f in sorted(srcs & _FINDER_SOURCES):
@@ -1286,6 +1288,29 @@ def _confirm_signals(sources, v: dict) -> list[str]:
         sigs.append("smtp-250")
     if (checks.get("enumeration") or {}).get("found_on"):
         sigs.append("enumeration")
+    # F7 Bayes fusion: combine all available signals into a calibrated probability.
+    # Acts as a tie-breaker for multi-source published emails that lack direct SMTP/API proof.
+    # Never downgrades — only adds to the signal list when Bayes is confident.
+    try:
+        from mcp_base.frontier.bayes import fuse as _bf
+        _bs: dict = {}
+        if api.get("verdict") is True: _bs["api_valid"] = True
+        if api.get("verdict") is False: _bs["api_invalid"] = True
+        if str(checks.get("smtp")) == "250": _bs["smtp_250"] = True
+        if str(checks.get("smtp")) == "550": _bs["smtp_550"] = True
+        if checks.get("mx_ok") or checks.get("mx"): _bs["mx_ok"] = True
+        if (checks.get("reacher") or {}).get("is_reachable") == "safe": _bs["reacher_safe"] = True
+        if (checks.get("gravatar") or {}).get("found"): _bs["gravatar"] = True
+        if (checks.get("enumeration") or {}).get("found_on"): _bs["enumeration_hit"] = True
+        _pub = srcs & _PUBLISHED_SOURCES
+        if _pub: _bs["published_on_site"] = True
+        if len(srcs) >= 2: _bs["corroborated"] = True
+        if srcs & _FINDER_SOURCES: _bs["pattern_match"] = True
+        _br = _bf(_bs)
+        if _br.get("probability", 0) >= 0.65:
+            sigs.append(f"bayes:{_br['confidence']}:{round(_br.get('probability', 0), 2)}")
+    except Exception:  # noqa: BLE001
+        pass
     return sigs
 
 

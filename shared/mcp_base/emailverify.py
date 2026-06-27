@@ -1120,6 +1120,33 @@ def _build(email: str, deliverable: bool | None, score: int,
         "summary": summary,
         "cached": False,
     }
+    # F7 Bayes — additive transparency layer: calibrated probability from in-verify signals only.
+    # Enabled by default (VERIFY_BAYES=1). Does not override confidence — server-side _confirm_signals
+    # uses the fuller per-candidate signals (sources list + corroboration) to drive any boost.
+    try:
+        from .config import get_env as _ge
+        if (_ge("VERIFY_BAYES", "1") or "1") != "0":
+            from .frontier.bayes import fuse as _bf
+            _bs: dict = {}
+            _api = (checks.get("api") or {})
+            if _api.get("verdict") is True:   _bs["api_valid"]      = True
+            if _api.get("verdict") is False:  _bs["api_invalid"]    = True
+            _smtp = str(checks.get("smtp") or "")
+            if _smtp == "250":                _bs["smtp_250"]        = True
+            if _smtp == "550":                _bs["smtp_550"]        = True
+            if checks.get("mx_ok") or checks.get("mx"):  _bs["mx_ok"] = True
+            _rch = checks.get("reacher") or {}
+            if _rch.get("is_reachable") == "safe":       _bs["reacher_safe"] = True
+            _grv = checks.get("gravatar") or {}
+            if _grv.get("found"):             _bs["gravatar"]       = True
+            _enum = checks.get("enumeration") or {}
+            if _enum.get("found_on"):         _bs["enumeration_hit"] = True
+            _br = _bf(_bs)
+            result["bayes"] = {"probability": _br.get("probability"),
+                               "confidence": _br.get("confidence"),
+                               "used": _br.get("used", [])}
+    except Exception:  # noqa: BLE001
+        pass
     if use_cache and email:
         _cache_put(result)
     return result
