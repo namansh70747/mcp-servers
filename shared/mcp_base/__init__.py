@@ -27,6 +27,7 @@ from .errors import err, not_found, ok
 from .gmail import DEFAULT_GMAIL_SCOPES, get_gmail_service, gmail_auth_status
 from .log import get_logger
 from .store import BaseStore
+from .deadline import Deadline
 
 # ── Optional submodules: lazily imported on first attribute access ─────────
 # Any server that does `from mcp_base import harvest` or `mcp_base.harvest.fn`
@@ -64,6 +65,7 @@ __all__ = [
     "get_gmail_service", "gmail_auth_status", "DEFAULT_GMAIL_SCOPES",
     "ok", "err", "not_found",
     "get_logger",
+    "Deadline",
     # Core submodules (eagerly loaded)
     "http", "scrape", "fetch", "embed", "semantic", "chrome",
     # Optional submodules (lazily loaded via __getattr__)

@@ -225,12 +225,12 @@ def typo_suggestion(email: str) -> str | None:
 # Gravatar existence check
 # ---------------------------------------------------------------------------
 
-def gravatar_exists(email: str) -> bool:
+def gravatar_exists(email: str, timeout: float = 8.0) -> bool:
     """True if the email has a Gravatar (SHA256; keyless)."""
     try:
         h = hashlib.sha256(email.strip().lower().encode()).hexdigest()
         from .fetch import fetch
-        r = fetch(f"https://www.gravatar.com/avatar/{h}?d=404", timeout=8.0)
+        r = fetch(f"https://www.gravatar.com/avatar/{h}?d=404", timeout=min(timeout, 8.0))
         return r.get("status") == 200
     except Exception:
         return False
@@ -363,7 +363,7 @@ def _smtp_probe(email: str, mx_hosts: list[str]) -> str:
 # Reacher self-hosted verifier
 # ---------------------------------------------------------------------------
 
-def _reacher_verify(email: str) -> dict | None:
+def _reacher_verify(email: str, timeout: float = 30.0) -> dict | None:
     """Call the self-hosted Reacher HTTP API if configured."""
     base_url = os.environ.get("REACHER_BASE_URL", "").strip()
     if not base_url:
@@ -371,7 +371,7 @@ def _reacher_verify(email: str) -> dict | None:
     try:
         from .http import request
         r = request("POST", f"{base_url.rstrip('/')}/v0/check_email",
-                    json_body={"to_email": email}, timeout=30.0)
+                    json_body={"to_email": email}, timeout=min(timeout, 30.0))
         if r.get("ok") and r.get("json"):
             return r["json"]
     except Exception:
@@ -402,26 +402,37 @@ def _reoon_verify(email: str, key: str) -> dict:
     return r
 
 
-def _verifalia_verify(email: str, username: str, password: str) -> dict:
+def _verifalia_verify(email: str, username: str, password: str,
+                      deadline=None) -> dict:
     """Verifalia v2.6: POST the email, then (if the job is still processing) poll once. Basic auth
     accepts the account email+password OR a browser-app key as username with an empty password.
-    Returns {entries:{data:[{classification,status}]}} for _parse_api_verdict."""
+    Returns {entries:{data:[{classification,status}]}} for _parse_api_verdict.
+
+    When ``deadline`` is provided (a ``Deadline`` instance) the 2-second polling sleep is skipped
+    when there is insufficient budget, preventing Verifalia from blowing the global find budget.
+    """
     import base64
 
     from .http import request
     creds = base64.b64encode(f"{username}:{password}".encode()).decode()
     headers = {"Authorization": f"Basic {creds}", "Content-Type": "application/json"}
+    _post_timeout = 25 if deadline is None else deadline.op(20.0)
     r = request("POST", "https://api.verifalia.com/v2.6/email-validations?waitTime=20000",
-                headers=headers, json_body={"entries": [{"inputData": email}]}, timeout=25)
+                headers=headers, json_body={"entries": [{"inputData": email}]},
+                timeout=_post_timeout)
     j = (r.get("json") or {}) if isinstance(r, dict) else {}
     # If still processing (202 with no data), poll the job once by its id.
     data = ((j.get("entries") or {}).get("data")) if isinstance(j, dict) else None
     if not data:
         jid = ((j.get("overview") or {}).get("id")) or j.get("id")
         if jid:
-            time.sleep(2.0)
+            # Skip the sleep when deadline is tight (< 4s remaining) to avoid blowing budget.
+            _remaining = deadline.remaining() if deadline is not None else 9999.0
+            if _remaining >= 4.0:
+                time.sleep(min(2.0, _remaining - 2.0))
+            _get_timeout = 20 if deadline is None else deadline.op(15.0)
             r2 = request("GET", f"https://api.verifalia.com/v2.6/email-validations/{jid}",
-                         headers=headers, timeout=20)
+                         headers=headers, timeout=_get_timeout)
             j = (r2.get("json") or {}) if isinstance(r2, dict) else j
     return j
 
@@ -463,10 +474,11 @@ _KEYLESS_VERIFIERS = {"rapid", "disify"}
 # Provider name → call lambda factory. The registry supplies the *order*; this maps each verify
 # provider to how it's actually invoked. Adding a verifier = one registry entry + one line here.
 # Verifalia/Tomba pull their second secret from env; rapid/disify ignore the key (keyless).
-def _verify_call_for(name: str, email: str):
+def _verify_call_for(name: str, email: str, deadline=None):
     table = {
         "hunter_verify": lambda k: _hunter_verify(email, k),
-        "verifalia":     lambda k: _verifalia_verify(email, k, os.environ.get("VERIFALIA_PASSWORD", "")),
+        "verifalia":     lambda k: _verifalia_verify(email, k, os.environ.get("VERIFALIA_PASSWORD", ""),
+                                                     deadline=deadline),
         "abstract":      lambda k: _abstract_verify(email, k),
         "mailboxlayer":  lambda k: _mailboxlayer_verify(email, k),
         "reoon":         lambda k: _reoon_verify(email, k),
@@ -503,7 +515,7 @@ def _api_provider_order() -> list[str]:
 
 
 def _run_api_tier(email: str, degraded: list[str], checks: dict,
-                  want: int = 1) -> tuple[bool | None, int]:
+                  want: int = 1, deadline=None) -> tuple[bool | None, int]:
     """Run free-tier API verifiers in registry order (quota-gated). `want` = number of independent
     verdicts to collect for CONSENSUS (default 1 = first verdict, original behavior; >1 keeps polling
     verifiers until that many real verdicts agree/disagree). Returns (deliverable, score_delta) and
@@ -515,7 +527,10 @@ def _run_api_tier(email: str, degraded: list[str], checks: dict,
     for name in _api_provider_order():
         if (valids + invalids) >= want:
             break
-        call = _verify_call_for(name, email)
+        # Skip if deadline already expired — don't start a new API call we can't finish.
+        if deadline is not None and deadline.expired():
+            break
+        call = _verify_call_for(name, email, deadline=deadline)
         if call is None:
             continue
         keyless = name in _KEYLESS_VERIFIERS
@@ -640,6 +655,8 @@ def verify(
     deep: bool = False,
     consensus: int = 1,
     extra_signals: dict | None = None,
+    deadline=None,
+    budget_s: float | None = None,
 ) -> dict:
     """Full verification pipeline. Never raises.
 
@@ -767,35 +784,134 @@ def verify(
         except Exception as e:
             degraded.append(f"dnsbl:error:{str(e)[:40]}")
 
-    # --- 8. Reacher self-hosted ---
+    # --- 8-13. Parallel: independent slow signals (Reacher ∥ SMTP ∥ Gravatar ∥ Enum ∥ API) ---
+    # The cheap serial checks (syntax→MX→fingerprint) already set smtp_skip, mx_list, is_big.
+    # Everything from here is independent — run concurrently under a shared deadline so no single
+    # slow signal (Verifalia 47s, Reacher 30s, holehe 30s) can stall the caller.
+    import concurrent.futures as _cf_par
+
+    # Build a per-call deadline so individual ops never exceed remaining budget.
+    try:
+        from .deadline import Deadline as _DL
+        _VERIFY_DEFAULT = float(get_env("VERIFY_BUDGET_S", "10") or 10)
+        _PAR_DL = _DL.of(deadline if deadline is not None else budget_s, _VERIFY_DEFAULT)
+    except Exception:
+        _PAR_DL = None  # no deadline module yet — run without extra caps
+
+    # Thread-local state for signals that write to degraded/checks (passed to parallel jobs).
+    _par_degraded: list[str] = []
+    _smtp_result_holder: list = ["unknown"]  # mutable container so the lambda can close over it
+
+    _do_smtp_probe = check_smtp and not smtp_skip and bool(mx_list)
+    _do_enum = bool(deep)
+    _do_ghunt = bool(deep) and domain in ("gmail.com", "googlemail.com")
+
+    def _job_reacher():
+        t = _PAR_DL.op(8.0) if _PAR_DL else 8.0
+        return _reacher_verify(email, timeout=t)
+
+    def _job_smtp():
+        return _smtp_probe(email, mx_list) if _do_smtp_probe else None
+
+    def _job_gravatar():
+        t = _PAR_DL.op(6.0) if _PAR_DL else 8.0
+        return gravatar_exists(email, timeout=t)
+
+    def _job_enum():
+        if not _do_enum:
+            return None
+        try:
+            from .enumerate_accounts import probe
+            t = _PAR_DL.op(15.0) if _PAR_DL else 30.0
+            return probe(email, timeout=t)
+        except Exception as exc:
+            return {"_error": str(exc)}
+
+    def _job_ghunt():
+        if not _do_ghunt:
+            return None
+        try:
+            from .osint_engines import ghunt_check
+            return ghunt_check(email)
+        except Exception as exc:
+            return {"_error": str(exc)}
+
+    def _job_api():
+        # Use LOCAL lists/dict so writes don't race with the main thread.
+        _d: list[str] = []
+        _c: dict = {}
+        r = _run_api_tier(email, _d, _c, want=consensus,
+                          deadline=_PAR_DL)
+        return r, _d, _c  # (deliverable, delta), degraded_extra, checks_update
+
+    _signal_jobs = {
+        "reacher": _job_reacher,
+        "smtp": _job_smtp,
+        "gravatar": _job_gravatar,
+        "enum": _job_enum,
+        "ghunt": _job_ghunt,
+        "api": _job_api,
+    }
+
+    _par_results: dict = {}
+    _overall_timeout = (_PAR_DL.remaining() + 1.0) if _PAR_DL else 60.0
+
+    _par_pool = _cf_par.ThreadPoolExecutor(max_workers=len(_signal_jobs))
+    _par_futs: dict = {_par_pool.submit(fn): name for name, fn in _signal_jobs.items()}
+    try:
+        for _pfut in _cf_par.as_completed(_par_futs, timeout=_overall_timeout):
+            _pname = _par_futs[_pfut]
+            try:
+                _par_results[_pname] = _pfut.result(timeout=0.5)
+            except Exception as _pexc:
+                _par_results[_pname] = _pexc
+            # Short-circuit: Reacher said definitively invalid → cancel all remaining signals.
+            if _pname == "reacher":
+                _rv = _par_results.get("reacher")
+                if isinstance(_rv, dict) and _rv.get("is_reachable") == "invalid":
+                    for _f in _par_futs:
+                        _f.cancel()
+                    break
+    except Exception:
+        pass  # overall timeout — use whatever arrived
+    finally:
+        _par_pool.shutdown(wait=False, cancel_futures=True)
+
+    # ── Merge: Reacher ─────────────────────────────────────────────────────────
     methods.append("reacher")
-    reacher_result = _reacher_verify(email)
-    if reacher_result is not None:
-        checks["reacher"] = reacher_result
-        is_reachable = reacher_result.get("is_reachable", "")
-        if is_reachable == "safe":
+    _reacher_res = _par_results.get("reacher")
+    if isinstance(_reacher_res, dict) and not _reacher_res.get("_error"):
+        checks["reacher"] = _reacher_res
+        _is_reachable = _reacher_res.get("is_reachable", "")
+        if _is_reachable == "safe":
             score += _W["reacher_ok"]
             deliverable = True
             reasons.append("Reacher: safe/deliverable")
-        elif is_reachable == "invalid":
+        elif _is_reachable == "invalid":
             score -= 30
             deliverable = False
             reasons.append("Reacher: invalid")
         else:
-            reasons.append(f"Reacher: {is_reachable} (inconclusive)")
+            reasons.append(f"Reacher: {_is_reachable} (inconclusive)")
     else:
-        degraded.append("reacher:not-configured")
+        _par_degraded.append("reacher:not-configured")
 
     # Early exit if Reacher gave a definitive verdict
     if deliverable is False:
+        degraded.extend(_par_degraded)
         return _build(email, False, score, checks, methods, reasons, degraded,
                       suggestion, _summary(email, False, score, reasons, provider), use_cache=True)
 
-    # --- 9. SMTP probe ---
+    # ── Merge: SMTP ────────────────────────────────────────────────────────────
     smtp_result = "unknown"
-    if check_smtp and not smtp_skip and mx_list:
-        methods.append("smtp")
-        smtp_result = _smtp_probe(email, mx_list)
+    _smtp_res = _par_results.get("smtp")
+    if not _do_smtp_probe:
+        if smtp_skip:
+            checks["smtp"] = "skipped_big_host"
+        else:
+            _par_degraded.append("smtp:no_mx")
+    elif isinstance(_smtp_res, str):
+        smtp_result = _smtp_res
         checks["smtp"] = smtp_result
         if smtp_result == "250":
             score += _W["smtp_250"]
@@ -809,60 +925,57 @@ def verify(
         elif smtp_result == "catch_all":
             score += _W["catch_all"]
             reasons.append("SMTP: catch-all domain (all addresses accepted)")
-            degraded.append("smtp:catch_all")
+            _par_degraded.append("smtp:catch_all")
         elif smtp_result == "blocked":
-            degraded.append("smtp:egress-blocked" if smtp_egress_blocked() else "smtp:blocked")
+            _par_degraded.append("smtp:egress-blocked" if smtp_egress_blocked() else "smtp:blocked")
         else:
-            degraded.append(f"smtp:{smtp_result}")
-    elif smtp_skip:
-        checks["smtp"] = "skipped_big_host"
+            _par_degraded.append(f"smtp:{smtp_result}")
     else:
-        degraded.append("smtp:no_mx")
+        _par_degraded.append("smtp:timeout")
+    methods.append("smtp")
 
     # Early exit on hard SMTP rejection
     if deliverable is False and smtp_result == "550" and not is_big:
+        degraded.extend(_par_degraded)
         return _build(email, False, score, checks, methods, reasons, degraded,
                       suggestion, _summary(email, False, score, reasons, provider), use_cache=True)
 
-    # --- 10. Account-existence enumeration (holehe) ---
-    if deep:
+    # ── Merge: Enumeration ────────────────────────────────────────────────────
+    if _do_enum:
         methods.append("enumeration")
-        try:
-            from .enumerate_accounts import probe
-            enum_result = probe(email)
-            checks["enumeration"] = enum_result
-            if enum_result.get("found_on"):
+        _enum_res = _par_results.get("enum")
+        if isinstance(_enum_res, dict) and not _enum_res.get("_error"):
+            checks["enumeration"] = _enum_res
+            if _enum_res.get("found_on"):
                 score += _W["enumeration_hit"]
                 deliverable = True
-                reasons.append(f"Account found on: {', '.join(enum_result['found_on'][:3])}")
-        except Exception as e:
-            degraded.append(f"enumeration:error:{str(e)[:40]}")
+                reasons.append(f"Account found on: {', '.join(_enum_res['found_on'][:3])}")
+        elif isinstance(_enum_res, Exception):
+            _par_degraded.append(f"enumeration:error:{str(_enum_res)[:40]}")
 
-    # --- 11. GHunt (for Gmail) ---
-    if deep and domain in ("gmail.com", "googlemail.com"):
+    # ── Merge: GHunt ──────────────────────────────────────────────────────────
+    if _do_ghunt:
         methods.append("ghunt")
-        try:
-            from .osint_engines import ghunt_check
-            gh = ghunt_check(email)
-            if gh:
-                checks["ghunt"] = gh
-                score += _W["enumeration_hit"]
-                deliverable = True
-                reasons.append(f"GHunt: Gmail confirmed, owner: {gh.get('name', 'unknown')}")
-        except Exception as e:
-            degraded.append(f"ghunt:error:{str(e)[:40]}")
+        _ghunt_res = _par_results.get("ghunt")
+        if isinstance(_ghunt_res, dict) and not _ghunt_res.get("_error") and _ghunt_res:
+            checks["ghunt"] = _ghunt_res
+            score += _W["enumeration_hit"]
+            deliverable = True
+            reasons.append(f"GHunt: Gmail confirmed, owner: {_ghunt_res.get('name', 'unknown')}")
+        elif isinstance(_ghunt_res, Exception):
+            _par_degraded.append(f"ghunt:error:{str(_ghunt_res)[:40]}")
 
-    # --- 12. Gravatar ---
+    # ── Merge: Gravatar ───────────────────────────────────────────────────────
     methods.append("gravatar")
-    try:
-        has_gravatar = gravatar_exists(email)
-        checks["gravatar"] = has_gravatar
-        if has_gravatar:
+    _gravatar_res = _par_results.get("gravatar")
+    if isinstance(_gravatar_res, bool):
+        checks["gravatar"] = _gravatar_res
+        if _gravatar_res:
             score += _W["gravatar"]
             deliverable = deliverable or True  # don't override a False
             reasons.append("Gravatar profile found")
-    except Exception as e:
-        degraded.append(f"gravatar:error:{str(e)[:40]}")
+    elif isinstance(_gravatar_res, Exception):
+        _par_degraded.append(f"gravatar:error:{str(_gravatar_res)[:40]}")
 
     # --- External signals ---
     if signals.get("published_site"):
@@ -879,19 +992,24 @@ def verify(
         score += _W["pattern_match"]
         reasons.append("Matches learned domain pattern")
 
-    # --- 13. Free-tier API tier ---
-    # Run when the verdict is still soft (None or weak score), OR when the caller explicitly wants a
-    # multi-verifier CONSENSUS on the winner (consensus>1) — even if SMTP already said deliverable.
+    # ── Merge: API tier ───────────────────────────────────────────────────────
     if deliverable is None or score < 40 or consensus > 1:
         methods.append("api_tier")
-        api_deliverable, api_delta = _run_api_tier(email, degraded, checks, want=consensus)
-        score += api_delta
-        if api_deliverable is not None:
-            deliverable = api_deliverable
-            if api_deliverable:
-                reasons.append("API verifier: valid")
-            else:
-                reasons.append("API verifier: invalid")
+        _api_res = _par_results.get("api")
+        if isinstance(_api_res, tuple) and len(_api_res) == 3:
+            (_api_deliverable, _api_delta), _api_degrade, _api_checks_update = _api_res
+            score += _api_delta
+            _par_degraded.extend(_api_degrade)
+            checks.update(_api_checks_update)
+            if _api_deliverable is not None:
+                deliverable = _api_deliverable
+                if _api_deliverable:
+                    reasons.append("API verifier: valid")
+                else:
+                    reasons.append("API verifier: invalid")
+
+    # Merge parallel-collected degraded messages into the caller's list.
+    degraded.extend(_par_degraded)
 
     # --- 13b. Bayesian likelihood-ratio fusion (F7) — calibrated probability alongside the
     # additive score. Purely additive model stays the verdict driver; this is a second opinion. ---
