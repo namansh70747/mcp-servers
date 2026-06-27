@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS neg_cache(
 );
 """
 store = BaseStore(db_path("email-finder"), schema=SCHEMA)
-JOBS = Jobs("email-finder", max_concurrent=2, inline_wait=12.0)
+JOBS = Jobs("email-finder", max_concurrent=int(get_env("EMAIL_JOBS_MAX", "3") or 3),
+            inline_wait=12.0)
 
 CACHE_TTL_DAYS = 14
 CACHE_STALE_DAYS = 7   # after this many days, cache hit returns one notch lower confidence + stale:True
@@ -86,6 +87,8 @@ PER_VERIFY_S = float(get_env("EMAIL_PER_VERIFY_S", "8") or 8)
 SCRAPE_BUDGET_S = float(get_env("EMAIL_SCRAPE_BUDGET_S", "25") or 25)
 # Polite pause between sequential Apollo reveals in a bulk run (respect the free tier's rate).
 BULK_REVEAL_DELAY_S = float(get_env("BULK_REVEAL_DELAY_S", "1.5") or 1.5)
+# Parallel workers for the keyless bulk_find path (clamped 1-16).
+BULK_WORKERS = max(1, min(int(get_env("BULK_WORKERS", "8") or 8), 16))
 BIG_HOSTS = ("google", "gmail", "outlook", "microsoft", "office365", "protonmail", "zoho", "yahoo")
 ROLE_LOCALS = {"info", "sales", "support", "hello", "contact", "admin", "team", "help",
                "office", "press", "media", "jobs", "careers", "hr", "billing", "no-reply",
@@ -2162,8 +2165,9 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
 
         def _resolve(i: int) -> None:
             it = items[i]
-            if it.get("linkedin_url") or not it.get("company"):
+            if not it.get("company"):
                 return
+            caller_li = (it.get("linkedin_url") or "").rstrip("/")
             # PRIMARY — Apollo people-search (cached; instant on repeat companies)
             try:
                 _guess = (_domain_candidates(it["company"]) or [""])[0]
@@ -2174,13 +2178,18 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
                     best = _pick_role_person(ppl, role)
                     if best:
                         it["name"] = it.get("name") or best.get("name")
-                        it["linkedin_url"] = (best.get("linkedin_url") or "").split("?")[0]
-                        it["_apollo_seed"] = best   # carries the verified email for a no-reveal settle
+                        seed_li = (best.get("linkedin_url") or "").split("?")[0].rstrip("/")
+                        # Only adopt seed LinkedIn/email when caller gave none, or seed matches.
+                        if not caller_li or seed_li == caller_li:
+                            it["linkedin_url"] = seed_li or it.get("linkedin_url", "")
+                            it["_apollo_seed"] = best
                     rows[i].update(linkedin_url=it.get("linkedin_url") or None,
                                    domain=it.get("domain") or None, name=it.get("name") or None)
                     return
             except Exception:
                 pass
+            if caller_li:
+                return  # already have LinkedIn; skip public-web fallback
             # FALLBACK — public web discovery (bounded; Apollo already tried)
             try:
                 person = _people.find_exec(it["company"], role=role, budget_s=12.0)
@@ -2194,8 +2203,7 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
             except Exception:
                 pass
 
-        need = [i for i, it in enumerate(items) if use_extensions and not it.get("linkedin_url")
-                and it.get("company")]
+        need = [i for i, it in enumerate(items) if use_extensions and it.get("company")]
         if need:
             with ThreadPoolExecutor(max_workers=6) as pool:
                 list(_ac([pool.submit(_resolve, i) for i in need]))
@@ -2253,20 +2261,26 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
     pending_idxs = [i for i in range(len(items)) if rows[i]["status"] != "cached"]
 
     if use_extensions:
-        # Sequential for Apollo CDP (single panel, one person at a time).
-        for i in pending_idxs:
+        # Seeded rows first (instant, 0-credit, no pause), then reveal rows.
+        _seeded = {i for i in pending_idxs
+                   if items[i].get("_apollo_seed") and items[i]["_apollo_seed"].get("email")}
+        ordered_idxs = [i for i in pending_idxs if i in _seeded] + \
+                       [i for i in pending_idxs if i not in _seeded]
+        _done = 0
+        for i in ordered_idxs:
             _resolve_one(i)
+            _done += 1
             if progress:
-                progress(i + 1, len(items), rows)
+                progress(_done, len(items), rows)
             # Politeness pause ONLY after a real Apollo reveal (not cache or seeded rows).
             _settled_by_seed = bool(items[i].get("_apollo_seed") and items[i]["_apollo_seed"].get("email"))
-            if BULK_REVEAL_DELAY_S and i < len(items) - 1 and not _settled_by_seed:
+            if BULK_REVEAL_DELAY_S and _done < len(ordered_idxs) and not _settled_by_seed:
                 _time.sleep(BULK_REVEAL_DELAY_S)
     else:
-        # Parallel for keyless find — each _find_core is fully independent, max 5 concurrent.
+        # Parallel for keyless find — each _find_core is fully independent.
         # 50 items: ~37min sequential → ~4-5min parallel.
         _done_count = 0
-        with _cf.ThreadPoolExecutor(max_workers=5) as _bulk_pool:
+        with _cf.ThreadPoolExecutor(max_workers=BULK_WORKERS) as _bulk_pool:
             _bulk_futs = {_bulk_pool.submit(_resolve_one, i): i for i in pending_idxs}
             for _fut in _cf.as_completed(_bulk_futs):
                 _done_count += 1
