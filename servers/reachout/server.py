@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -37,6 +38,7 @@ DAILY_CAP = int(os.environ.get("REACHOUT_DAILY_CAP", "20"))
 COOLDOWN_DAYS = int(os.environ.get("REACHOUT_COOLDOWN_DAYS", "14"))
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 MAX_ATTACH_BYTES = 25 * 1024 * 1024  # 25 MB per attachment (Gmail's own limit)
+_BATCH_CHUNK = 50  # Gmail batch API limit before throttling kicks in
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS outreach(
@@ -84,7 +86,7 @@ def _ensure_columns() -> None:
         "thread_id": "TEXT", "scheduled_for": "TEXT", "snooze_until": "TEXT",
         "sequence_id": "INTEGER", "step": "INTEGER DEFAULT 0", "variant": "TEXT DEFAULT ''",
         "opened_at": "TEXT", "replied_at": "TEXT", "contact_id": "INTEGER",
-        "body": "TEXT DEFAULT ''",
+        "body": "TEXT DEFAULT ''", "draft_id": "TEXT",
     }
     for col, decl in wanted.items():
         if col not in have:
@@ -146,11 +148,36 @@ def _log_event(outreach_id: int | None, kind: str, meta: str = "") -> None:
                   (outreach_id, kind, _now(), meta))
 
 
-# ---------- Gmail (lazy; only when a send/draft tool is called) ----------
+# ---------- Gmail (cached, thread-safe; only when a send/draft tool is called) ----------
+_SERVICE = None
+_SERVICE_CREDS = None
+_SERVICE_LOCK = threading.RLock()
+_REFRESH_SKEW = 120  # re-build when token has < 2 min until expiry
+
+
+def _creds_fresh(creds) -> bool:
+    """True when creds are valid and not within _REFRESH_SKEW seconds of expiry."""
+    if not creds or not creds.valid:
+        return False
+    try:
+        if creds.expiry is None:
+            return True
+        exp = creds.expiry
+        # google-auth expiry is typically naive UTC; handle both naive and aware
+        now = datetime.utcnow() if exp.tzinfo is None else datetime.now(timezone.utc)
+        return (exp - now).total_seconds() > _REFRESH_SKEW
+    except Exception:  # noqa: BLE001 — never let a cache check break a send
+        return False
+
+
 def _gmail():
-    """Build the Gmail service via the shared mcp_base helper (handles OAuth + token cache)."""
-    from mcp_base import get_gmail_service
-    return get_gmail_service(DATA, SCOPES)
+    """Return the cached Gmail service; build or refresh when stale (build-once + keep-alive)."""
+    global _SERVICE, _SERVICE_CREDS
+    with _SERVICE_LOCK:
+        if _SERVICE is None or not _creds_fresh(_SERVICE_CREDS):
+            from mcp_base import get_gmail_service
+            _SERVICE, _SERVICE_CREDS = get_gmail_service(DATA, SCOPES, return_creds=True)
+        return _SERVICE
 
 
 def _gmail_or_err() -> tuple[object | None, dict | None]:
@@ -403,6 +430,247 @@ def delete_draft(draft_id: str, outreach_id: int | None = None) -> dict:
                       (outreach_id,))
         _log_event(outreach_id, "deleted", "delete_draft")
     return {"ok": True, "draft_id": draft_id, "status": "deleted"}
+
+
+@mcp.tool
+def create_drafts_bulk(rows: list[dict], common: dict | None = None,
+                       send: bool = False) -> dict:
+    """Create multiple Gmail drafts in one batch API call (≤50 per POST chunk).
+
+    Each row needs: to_email, subject, body. Optional: recipient_name, company, role,
+    template_used, attachments, variant, sequence_id, step, contact_id.
+    common: fields merged into every row (row values take precedence).
+    send=True: immediately send the cap/cooldown-allowed subset after drafting.
+
+    Returns {ok, created, sent, results:[{row, status, draft_id, gmail_message_id,
+    outreach_id, to_email?, error?, blocked?}]}"""
+    if not rows:
+        return {"ok": True, "created": 0, "sent": 0, "results": []}
+    service, gerr = _gmail_or_err()
+    if gerr:
+        return {**gerr, "ok": False}
+
+    # Pre-validate + pre-build messages before any network call
+    pre_valid: list[tuple[int, dict, dict]] = []
+    pre_errors: dict[int, dict] = {}
+    for i, raw_row in enumerate(rows):
+        r = {**(common or {}), **raw_row}
+        email = r.get("to_email", "")
+        if not _valid_email(email):
+            pre_errors[i] = {"row": i, "status": "error", "error": f"invalid email: {email!r}"}
+            continue
+        try:
+            atts = list(r.get("attachments") or [])
+            if r.get("attach_onepager"):
+                atts.append(r["attach_onepager"])
+            msg = _build_message(email, r.get("subject", ""), r.get("body", ""), atts)
+            pre_valid.append((i, r, msg))
+        except Exception as e:  # noqa: BLE001 — attachment errors: surface per-row, not abort
+            pre_errors[i] = {"row": i, "status": "error", "error": str(e)}
+
+    # Batch-create valid rows in chunks (one POST per chunk)
+    batch_results: dict[int, dict] = {}
+    for chunk_start in range(0, len(pre_valid), _BATCH_CHUNK):
+        chunk = pre_valid[chunk_start:chunk_start + _BATCH_CHUNK]
+        chunk_resp: dict[int, dict] = {}
+
+        def _make_cb(row_idx: int, _resp: dict = chunk_resp):
+            def _cb(request_id, response, exception):
+                _resp[row_idx] = {"_err": str(exception)} if exception else response
+            return _cb
+
+        batch = service.new_batch_http_request()
+        for i, r, msg in chunk:
+            batch.add(service.users().drafts().create(userId="me", body={"message": msg}),
+                      callback=_make_cb(i), request_id=str(i))
+        with _SERVICE_LOCK:
+            batch.execute()
+
+        for i, r, _ in chunk:
+            resp = chunk_resp.get(i, {})
+            if "_err" in resp:
+                batch_results[i] = {"row": i, "status": "error", "error": resp["_err"]}
+                continue
+            draft_gid = resp.get("id", "")
+            msg_id = resp.get("message", {}).get("id", "")
+            thread_id = resp.get("message", {}).get("threadId", "")
+            oid = store.execute(
+                "INSERT INTO outreach(recipient_name,recipient_email,company,role,template_used,"
+                "subject,body,gmail_message_id,thread_id,draft_id,status,variant,sequence_id,"
+                "step,contact_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (r.get("recipient_name", ""), r["to_email"], r.get("company", ""),
+                 r.get("role", ""), r.get("template_used", ""), r.get("subject", ""),
+                 r.get("body", ""), msg_id, thread_id, draft_gid, "drafted",
+                 r.get("variant", ""), r.get("sequence_id"), r.get("step", 0),
+                 r.get("contact_id"), _now()),
+            )
+            _log_event(oid, "drafted", r.get("template_used", ""))
+            _reindex(oid)
+            batch_results[i] = {"row": i, "status": "drafted", "draft_id": draft_gid,
+                                 "gmail_message_id": msg_id, "outreach_id": oid,
+                                 "to_email": r["to_email"]}
+
+    # Combine errors + batch results in original row order
+    all_results: list[dict] = []
+    created = 0
+    for i in range(len(rows)):
+        if i in pre_errors:
+            all_results.append(pre_errors[i])
+        elif i in batch_results:
+            all_results.append(batch_results[i])
+            if batch_results[i]["status"] == "drafted":
+                created += 1
+
+    # Send cap-enforced subset if requested
+    sent = 0
+    if send and created > 0:
+        drafted = [r for r in all_results if r.get("status") == "drafted"]
+        with _SERVICE_LOCK:
+            cap_remaining = max(0, DAILY_CAP - _sent_today())
+        for r in drafted:
+            if cap_remaining <= 0:
+                r["blocked"] = "daily_cap"
+                continue
+            recent = _recent_to(r.get("to_email", ""))
+            if recent:
+                r["blocked"] = f"cooldown ({COOLDOWN_DAYS}d)"
+                continue
+            try:
+                with _SERVICE_LOCK:
+                    sent_msg = service.users().drafts().send(
+                        userId="me", body={"id": r["draft_id"]}).execute()
+                store.execute("UPDATE outreach SET status='sent', sent_at=? WHERE id=?",
+                              (_now(), r["outreach_id"]))
+                _log_event(r["outreach_id"], "sent", "bulk")
+                r["status"] = "sent"
+                r["gmail_message_id"] = sent_msg.get("id", r["gmail_message_id"])
+                sent += 1
+                cap_remaining -= 1
+            except Exception as e:  # noqa: BLE001 — per-row send error: surface, not abort
+                r["send_error"] = str(e)
+
+    return {"ok": True, "created": created, "sent": sent, "results": all_results}
+
+
+@mcp.tool
+def send_drafts_bulk(draft_ids: list[str]) -> dict:
+    """Send previously created drafts in one batch call (one POST per ≤50 chunk).
+    DAILY_CAP is enforced across the batch; cooldown is not re-checked (assumed verified at
+    draft creation time). Returns {ok, sent, results:[{draft_id, status, gmail_message_id?,
+    blocked?, error?}]}"""
+    if not draft_ids:
+        return {"ok": True, "sent": 0, "results": []}
+    service, gerr = _gmail_or_err()
+    if gerr:
+        return {**gerr, "ok": False}
+
+    with _SERVICE_LOCK:
+        cap_remaining = max(0, DAILY_CAP - _sent_today())
+
+    to_send: list[tuple[str, dict | None]] = []
+    results: list[dict] = []
+    for draft_id in draft_ids:
+        if cap_remaining <= 0:
+            results.append({"draft_id": draft_id, "status": "drafted", "blocked": "daily_cap"})
+            continue
+        row = store.query_one("SELECT id, recipient_email FROM outreach WHERE draft_id=?",
+                              (draft_id,))
+        to_send.append((draft_id, row))
+        cap_remaining -= 1
+
+    sent = 0
+    for chunk_start in range(0, len(to_send), _BATCH_CHUNK):
+        chunk = to_send[chunk_start:chunk_start + _BATCH_CHUNK]
+        chunk_resp: dict[str, dict] = {}
+
+        def _make_cb(d_id: str, _resp: dict = chunk_resp):
+            def _cb(request_id, response, exception):
+                _resp[d_id] = {"_err": str(exception)} if exception else response
+            return _cb
+
+        batch = service.new_batch_http_request()
+        for d_id, _ in chunk:
+            batch.add(service.users().drafts().send(userId="me", body={"id": d_id}),
+                      callback=_make_cb(d_id), request_id=d_id[:16])
+        with _SERVICE_LOCK:
+            batch.execute()
+
+        for d_id, row in chunk:
+            resp = chunk_resp.get(d_id, {})
+            if "_err" in resp:
+                results.append({"draft_id": d_id, "status": "error", "error": resp["_err"]})
+                continue
+            msg_id = resp.get("id", "")
+            if row:
+                store.execute("UPDATE outreach SET status='sent', sent_at=? WHERE id=?",
+                              (_now(), row["id"]))
+                _log_event(row["id"], "sent", "send_drafts_bulk")
+            results.append({"draft_id": d_id, "status": "sent", "gmail_message_id": msg_id})
+            sent += 1
+
+    return {"ok": True, "sent": sent, "results": results}
+
+
+@mcp.tool
+def draft_batch(recipients: list[dict], template_name: str,
+                common: dict | None = None, send: bool = True,
+                use_profile: bool = True) -> dict:
+    """One-call pipeline: render → create_drafts_bulk → (cap-enforced) send.
+    send=True by default. use_profile=True pre-fills sender/signature from profile.json.
+    Each recipient: {to_email, name?, company?, role?, ...extra template vars}.
+    Returns {ok, rendered, render_errors, render_error_details?, created, sent, results:[...]}"""
+    if not recipients:
+        return {"ok": True, "rendered": 0, "render_errors": 0, "created": 0, "sent": 0,
+                "results": []}
+
+    base_vars: dict = {}
+    if use_profile:
+        sig = signature_block()
+        p = _profile()
+        links = p.get("links", {}) or {}
+        base_vars = {"sender": sig.get("sender", ""), "signature": sig.get("signature", ""),
+                     "link": links.get("website") or links.get("github") or ""}
+
+    rows: list[dict] = []
+    render_errors: list[dict] = []
+    for i, recipient in enumerate(recipients):
+        variables: dict = {**base_vars}
+        for k, v in recipient.items():
+            if k != "to_email" and v not in (None, ""):
+                variables[k] = v
+        if recipient.get("name") and not variables.get("name"):
+            variables["name"] = recipient["name"]
+        rendered = _render(template_name, variables)
+        if "error" in rendered:
+            render_errors.append({"row": i, "to_email": recipient.get("to_email", ""),
+                                  "error": rendered["error"]})
+            continue
+        rows.append({
+            "to_email": recipient.get("to_email", ""),
+            "subject": rendered["subject"],
+            "body": rendered["body"],
+            "recipient_name": recipient.get("name") or recipient.get("recipient_name", ""),
+            "company": recipient.get("company", ""),
+            "role": recipient.get("role", ""),
+            "template_used": template_name,
+            **{k: recipient[k] for k in ("variant", "sequence_id", "step", "contact_id")
+               if recipient.get(k)},
+        })
+
+    if not rows:
+        return {"ok": True, "rendered": 0, "render_errors": len(render_errors),
+                "render_error_details": render_errors, "created": 0, "sent": 0, "results": []}
+
+    bulk = create_drafts_bulk(rows, common=common, send=send)
+    return {
+        "ok": bulk.get("ok", True),
+        "rendered": len(rows),
+        "render_errors": len(render_errors),
+        **({"render_error_details": render_errors} if render_errors else {}),
+        "created": bulk.get("created", 0),
+        "sent": bulk.get("sent", 0),
+        "results": bulk.get("results", []),
+    }
 
 
 @mcp.tool

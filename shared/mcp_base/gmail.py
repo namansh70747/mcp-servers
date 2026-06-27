@@ -42,6 +42,7 @@ def get_gmail_service(
     credentials_file: str = "credentials.json",
     token_file: str = "token.json",
     open_browser: bool = True,
+    return_creds: bool = False,
 ):
     """Build an authorized Gmail API client from files in `data_dir` (lazy imports).
 
@@ -83,4 +84,5 @@ def get_gmail_service(
                 creds = flow.run_console()
         token_path.write_text(creds.to_json())
 
-    return build("gmail", "v1", credentials=creds)
+    svc = build("gmail", "v1", credentials=creds)
+    return (svc, creds) if return_creds else svc
