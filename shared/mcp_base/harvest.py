@@ -11,8 +11,73 @@ import re
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin, urlsplit
 
+import json as _json_hc
+import sqlite3 as _sqlite3
+import threading as _thr_hc
+
 from .email_extract import extract_emails, filter_emails
 from .fetch import RateLimiter, fetch
+
+# ── Harvest page cache (conditional-GET / 304 skip) ───────────────────────────────────────────
+# Avoids re-fetching unchanged contact pages on repeat calls.  Stored as a sidecar SQLite in
+# data_dir("email-finder") so it persists across restarts but doesn't couple harvest.py to the
+# email-finder server module (no circular import).
+
+class _HarvestCache:
+    _lock = _thr_hc.Lock()
+    _conn: "_sqlite3.Connection | None" = None
+    _path: "str | None" = None
+
+    def _db(self) -> "_sqlite3.Connection":
+        if self._conn is not None:
+            return self._conn
+        with self._lock:
+            if self._conn is not None:
+                return self._conn
+            try:
+                from .config import data_dir
+                p = str(data_dir("email-finder")) + "/harvest_cache.db"
+            except Exception:
+                p = "/tmp/harvest_cache.db"
+            self._path = p
+            c = _sqlite3.connect(p, check_same_thread=False)
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS harvest_cache("
+                "  url TEXT PRIMARY KEY, etag TEXT, modified TEXT,"
+                "  emails_json TEXT, fetched_at TEXT)"
+            )
+            c.commit()
+            self._conn = c
+            return c
+
+    def get(self, url: str) -> "tuple[str|None,str|None,dict]":
+        """Return (etag, modified, emails_dict) from cache, or (None,None,{}) on miss."""
+        try:
+            row = self._db().execute(
+                "SELECT etag, modified, emails_json FROM harvest_cache WHERE url=?", (url,)
+            ).fetchone()
+            if row:
+                return row[0], row[1], _json_hc.loads(row[2] or "{}")
+        except Exception:
+            pass
+        return None, None, {}
+
+    def put(self, url: str, etag: "str|None", modified: "str|None", emails: dict) -> None:
+        """Upsert a URL's extracted emails into the cache."""
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
+            self._db().execute(
+                "INSERT OR REPLACE INTO harvest_cache(url,etag,modified,emails_json,fetched_at)"
+                " VALUES(?,?,?,?,?)",
+                (url, etag, modified, _json_hc.dumps(emails), now)
+            )
+            self._db().commit()
+        except Exception:
+            pass
+
+_HARVEST_CACHE = _HarvestCache()
+
 
 _DEFAULT_CONTACT_PATHS = [
     "/", "/about", "/about-us", "/contact", "/contact-us", "/team", "/people",
@@ -111,19 +176,34 @@ def harvest_emails(domain: str, name: str | None = None,
     _lock = threading.Lock()
 
     def _fetch_and_extract(url: str) -> dict[str, int]:
+        # Conditional-GET: if we have a cached ETag/Last-Modified, send it and skip re-extraction on 304.
         _RATE.wait(url)
-        result = _fetch_page(url, render_js=render_js)
-        if not result:
+        cached_etag, cached_mod, cached_emails = _HARVEST_CACHE.get(url)
+        r_raw = fetch(url, timeout=15.0, etag=cached_etag, modified=cached_mod)
+        if r_raw.get("not_modified") and cached_emails:
+            return cached_emails  # 304 — page unchanged, reuse
+        html = r_raw.get("html", "") if r_raw.get("ok") else ""
+        # JS render fallback for thin SPA shells
+        if not html or (len(html) < 2000 and html.count(" ") < 100):
+            try:
+                js_html = _playwright_render(url)
+                if js_html and len(js_html) > len(html):
+                    html = js_html
+            except Exception:
+                pass
+        if not html:
             return {}
-        found = extract_emails(result, domain_filter=None)
+        found = extract_emails(html, domain_filter=None)
         # F1 OCR: if the page renders emails as images, OCR them. No-op unless pytesseract installed.
         try:
             from .frontier.ocr import available as _ocr_ok, harvest_image_emails
             if _ocr_ok():
-                for e in harvest_image_emails(result, url):
+                for e in harvest_image_emails(html, url):
                     found[e] = max(found.get(e, 0), 2)
         except Exception:
             pass
+        # Cache the result so the next call gets a 304-skip
+        _HARVEST_CACHE.put(url, r_raw.get("etag"), r_raw.get("modified"), found)
         return found
 
     # Parallel fetch of contact pages (capped at 6 to avoid runaway).
