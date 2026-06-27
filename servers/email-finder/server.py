@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS domain_patterns(
 CREATE TABLE IF NOT EXISTS neg_cache(
   key TEXT PRIMARY KEY, stored_at TEXT
 );
+CREATE TABLE IF NOT EXISTS find_cache(
+  key TEXT PRIMARY KEY, name TEXT, company TEXT, domain TEXT,
+  best TEXT, confidence TEXT, source TEXT, result_json TEXT, stored_at TEXT
+);
 """
 store = BaseStore(db_path("email-finder"), schema=SCHEMA)
 JOBS = Jobs("email-finder", max_concurrent=int(get_env("EMAIL_JOBS_MAX", "3") or 3),
@@ -73,6 +77,8 @@ JOBS = Jobs("email-finder", max_concurrent=int(get_env("EMAIL_JOBS_MAX", "3") or
 CACHE_TTL_DAYS = 14
 CACHE_STALE_DAYS = 7   # after this many days, cache hit returns one notch lower confidence + stale:True
 NEG_CACHE_TTL_S = 6 * 3600  # 6h negative-result cache (same name+domain returned empty)
+FIND_CACHE_TTL_DAYS = int(get_env("FIND_CACHE_TTL_DAYS", "14") or 14)   # full TTL for high/medium
+FIND_CACHE_STALE_DAYS = int(get_env("FIND_CACHE_STALE_DAYS", "7") or 7) # decay after this many days
 # Hard wall-clock budget for find() so it can NEVER grind for minutes. The slow keyless waterfall
 # (web/Wayback/harvest/OSINT) is skipped once exceeded. Tighter when driving the Apollo extension.
 # Parallelised finder waterfall means 45s → 25s covers the same work.
@@ -310,6 +316,61 @@ def _neg_cache_get(name: str, domain: str) -> bool:
 def _neg_cache_put(name: str, domain: str) -> None:
     key = _neg_cache_key(name, domain)
     store.execute("INSERT OR REPLACE INTO neg_cache(key, stored_at) VALUES(?,?)", (key, _now()))
+
+
+# ── Persistent positive find_cache (repeat finds are instant) ──────────────────────────────────
+
+def _find_cache_get(name: str, domain: str) -> dict | None:
+    """Return a cached positive find result, or None if absent/expired/stale-decayed."""
+    import json as _json_fc
+    key = _neg_cache_key(name, domain)
+    row = store.query_one(
+        "SELECT confidence, result_json, stored_at FROM find_cache WHERE key=?", (key,))
+    if not row:
+        return None
+    try:
+        stored = datetime.fromisoformat(row["stored_at"])
+        age_days = (datetime.now(timezone.utc) - stored).total_seconds() / 86400
+        conf = row["confidence"] or "low"
+        # Low/inconclusive results expire faster (2d) than high/medium results
+        ttl = FIND_CACHE_TTL_DAYS if conf in ("high", "medium") else 2
+        if age_days > ttl:
+            return None
+        result = _json_fc.loads(row["result_json"])
+        if age_days > FIND_CACHE_STALE_DAYS:
+            result["stale"] = True
+            result["confidence"] = _decay_confidence(conf)
+        result["cached_find"] = True
+        return result
+    except Exception:
+        return None
+
+
+def _find_cache_put(name: str, company: str, domain: str, result: dict) -> None:
+    """Write a positive find result to the persistent cache. Never caches timed-out results."""
+    import json as _json_fc
+    if result.get("timed_out") or result.get("partial") or not result.get("best"):
+        return
+    key = _neg_cache_key(name, domain)
+    try:
+        store.execute(
+            "INSERT OR REPLACE INTO find_cache"
+            "(key, name, company, domain, best, confidence, source, result_json, stored_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (key, name, company, domain,
+             result.get("best", ""), result.get("confidence", ""), result.get("source", ""),
+             _json_fc.dumps(result), _now()))
+        # A confirmed positive find supersedes any negative-cache entry for the same person.
+        store.execute("DELETE FROM neg_cache WHERE key=?", (key,))
+    except Exception:
+        pass
+
+
+def _decay_confidence(conf: str) -> str:
+    """Decay confidence one notch for stale results."""
+    _order = ["none", "low", "medium", "high"]
+    idx = _order.index(conf) if conf in _order else 0
+    return _order[max(0, idx - 1)]
 
 
 @mcp.tool
@@ -1375,9 +1436,16 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
     dom = (domain or "").lower().lstrip("@")
     raw: list[tuple[str, str]] = []  # (email, source)
 
+    # Positive find-cache: repeat finds return in ~ms from the last resolved result.
+    # refresh=True forces a full re-resolve regardless of cache state.
+    if dom and not refresh:
+        _cached_find = _find_cache_get(name, dom)
+        if _cached_find:
+            return _cached_find
+
     # Negative-result cache: if this name+domain returned empty recently (and we're in the basic
     # path), return the cached miss instantly instead of re-running the entire waterfall.
-    if dom and not deep and not use_extensions and not use_agent and _neg_cache_get(name, dom):
+    if dom and not deep and not use_extensions and not use_agent and not refresh and _neg_cache_get(name, dom):
         return {"best": None, "confidence": "none", "cached_miss": True,
                 "note": "recent search found no email (negative cache); use deep=True to force retry",
                 "evidence": evidence,
@@ -1579,6 +1647,9 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                   "candidates": out_candidates, "evidence": evidence, "summary": _summary}
         if top.get("note"):
             result["note"] = top["note"]
+        # Persist positive result so repeat find() calls return instantly from the cache.
+        if dom and not evidence.get("timed_out"):
+            _find_cache_put(name, company, dom, result)
         return result
 
     # 0) a previously-learned pattern for this domain (free, no API call, highest priority)
