@@ -77,6 +77,12 @@ def _suppressed(company: str, domain: str, email: str = "") -> bool:
     return bool(row)
 
 
+def _chunks(lst: list, n: int):
+    """Yield n-sized chunks — keeps IN-clause params ≤ SQLite's 999-param limit (use ≤ 900)."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
 @mcp.tool
 def filter_uncontacted(companies: list[dict], respect_cooldown: bool = True) -> dict:
     """Given candidate companies [{company, domain}], return only those NOT already contacted
@@ -144,6 +150,80 @@ def record_outreach(company: str, domain: str = "", contacts: str = "", email: s
 
 
 @mcp.tool
+def bulk_record_outreach(rows: list[dict]) -> dict:
+    """Record multiple outreach sends in one call. One IN-scan pre-fetches existing ledger rows;
+    outreach_log inserts are batched with executemany (one DB transaction). Inputs chunked to
+    ≤900 to stay within SQLite's 999-param IN limit.
+    Each row: {company, domain?, contacts?, email?, contact_name?, cooldown_days?,
+               gmail_message_id?, thread_id?}
+    Returns {ok, recorded, updated_ledger, new_ledger}"""
+    if not rows:
+        return {"ok": True, "recorded": 0, "updated_ledger": 0, "new_ledger": 0}
+
+    now = _now()
+    now_iso = now.isoformat()
+    last_run = store.query_one("SELECT id FROM runs ORDER BY started_at DESC LIMIT 1")
+    run_id = last_run["id"] if last_run else None
+
+    # Pre-fetch all existing ledger rows in one IN-scan
+    company_vals = [_key(r.get("company") or "", "") for r in rows if r.get("company")]
+    domain_vals = [_key("", r.get("domain") or "") for r in rows if r.get("domain")]
+    all_keys = list(set(company_vals + domain_vals))
+    existing: dict[str, dict] = {}
+    for chunk in _chunks(all_keys, 900):
+        qs = ",".join("?" * len(chunk))
+        for row in store.query(
+            f"SELECT id, company, domain, count FROM ledger "
+            f"WHERE LOWER(COALESCE(domain,'')) IN ({qs}) "
+            f"OR LOWER(COALESCE(company,'')) IN ({qs})",
+            chunk + chunk,
+        ):
+            if row.get("domain"):
+                existing[_key("", row["domain"])] = row
+            if row.get("company"):
+                existing[_key(row["company"], "")] = row
+
+    updated_ledger = 0
+    new_ledger = 0
+    log_params: list[tuple] = []
+    for r in rows:
+        company = (r.get("company") or "").strip()
+        domain = (r.get("domain") or "").strip()
+        contacts = r.get("contacts") or ""
+        email = (r.get("email") or "").strip().lower()
+        contact_name = r.get("contact_name") or ""
+        cooldown_days = int(r.get("cooldown_days") or 0)
+        cooldown_until = (
+            (now + timedelta(days=cooldown_days)).isoformat() if cooldown_days > 0 else None
+        )
+        ex = existing.get(_key("", domain)) or existing.get(_key(company, ""))
+        if ex:
+            store.execute(
+                "UPDATE ledger SET last_contacted_at=?, count=count+1, cooldown_until=?, "
+                "contacts=COALESCE(NULLIF(?,''),contacts) WHERE id=?",
+                (now_iso, cooldown_until, contacts, ex["id"]),
+            )
+            updated_ledger += 1
+        else:
+            store.execute(
+                "INSERT INTO ledger(company,domain,contacts,first_contacted_at,"
+                "last_contacted_at,cooldown_until) VALUES(?,?,?,?,?,?)",
+                (company, domain, contacts, now_iso, now_iso, cooldown_until),
+            )
+            new_ledger += 1
+        log_params.append((company, domain, email, contact_name, now_iso, run_id,
+                           r.get("gmail_message_id") or None, r.get("thread_id") or None))
+
+    store.executemany(
+        "INSERT INTO outreach_log(company,domain,email,contact_name,sent_at,run_id,"
+        "gmail_message_id,thread_id) VALUES(?,?,?,?,?,?,?,?)",
+        log_params,
+    )
+    return {"ok": True, "recorded": len(rows),
+            "updated_ledger": updated_ledger, "new_ledger": new_ledger}
+
+
+@mcp.tool
 def is_contacted(company: str = "", domain: str = "", email: str = "") -> dict:
     """Check whether a company (by name/domain) has already been contacted, or is suppressed."""
     row = store.query_one(
@@ -162,6 +242,71 @@ def is_contacted(company: str = "", domain: str = "", email: str = "") -> dict:
             "suppressed": _suppressed(company, domain, email),
             "gmail_message_id": (last_msg or {}).get("gmail_message_id"),
             "thread_id": (last_msg or {}).get("thread_id")}
+
+
+@mcp.tool
+def bulk_is_contacted(keys: list[dict]) -> list[dict]:
+    """Check whether multiple companies have been contacted in one call. ~3 IN-scans regardless
+    of batch size (vs 3N queries for N serial is_contacted calls). Inputs chunked to ≤900.
+    Each key: {company?, domain?, email?}.
+    Returns a list aligned to input order: [{contacted, suppressed, cooldown_active, record?}]"""
+    if not keys:
+        return []
+
+    now_iso = _now().isoformat()
+
+    # One IN-scan on ledger for all company/domain keys
+    company_vals = [_key(k.get("company") or "", "") for k in keys if k.get("company")]
+    domain_vals = [_key("", k.get("domain") or "") for k in keys if k.get("domain")]
+    all_ledger_keys = list(set(company_vals + domain_vals))
+    ledger_rows: dict[str, dict] = {}
+    for chunk in _chunks(all_ledger_keys, 900):
+        qs = ",".join("?" * len(chunk))
+        for row in store.query(
+            f"SELECT company, domain, last_contacted_at, cooldown_until, count "
+            f"FROM ledger WHERE LOWER(COALESCE(domain,'')) IN ({qs}) "
+            f"OR LOWER(COALESCE(company,'')) IN ({qs})",
+            chunk + chunk,
+        ):
+            if row.get("domain"):
+                ledger_rows[_key("", row["domain"])] = row
+            if row.get("company"):
+                ledger_rows[_key(row["company"], "")] = row
+
+    # One IN-scan on suppression for all values
+    all_sup_vals = set()
+    for k in keys:
+        for v in (k.get("company", ""), k.get("domain", ""), k.get("email", "")):
+            if v:
+                all_sup_vals.add(v.strip().lower())
+    suppressed_set: set[str] = set()
+    for chunk in _chunks(list(all_sup_vals), 900):
+        qs = ",".join("?" * len(chunk))
+        for row in store.query(
+            f"SELECT value FROM suppression WHERE LOWER(value) IN ({qs})", chunk
+        ):
+            suppressed_set.add(row["value"].lower())
+
+    results = []
+    for k in keys:
+        company = (k.get("company") or "").strip()
+        domain = (k.get("domain") or "").strip()
+        email = (k.get("email") or "").strip().lower()
+        row = ledger_rows.get(_key("", domain)) or ledger_rows.get(_key(company, ""))
+        is_sup = bool(
+            (company and company.lower() in suppressed_set) or
+            (domain and domain.lower() in suppressed_set) or
+            (email and email in suppressed_set)
+        )
+        cd = (row or {}).get("cooldown_until")
+        cooldown_active = bool(cd and cd > now_iso)
+        results.append({
+            "contacted": bool(row),
+            "suppressed": is_sup,
+            "cooldown_active": cooldown_active,
+            **({"record": dict(row)} if row else {}),
+        })
+    return results
 
 
 @mcp.tool
