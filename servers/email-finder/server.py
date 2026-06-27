@@ -84,7 +84,9 @@ FIND_CACHE_STALE_DAYS = int(get_env("FIND_CACHE_STALE_DAYS", "7") or 7) # decay 
 # Parallelised finder waterfall means 45s → 25s covers the same work.
 FIND_BUDGET_S = float(get_env("FIND_BUDGET_S", "10") or 10)
 FIND_BUDGET_EXT_S = float(get_env("FIND_BUDGET_EXT_S", "12") or 12)
-FIND_BUDGET_DEEP_S = float(get_env("FIND_BUDGET_DEEP_S", "90") or 90)
+FIND_BUDGET_DEEP_S = float(get_env("FIND_BUDGET_DEEP_S", "120") or 120)
+# Auto-escalation budget: fires when Stage A returns low/none confidence; races the full arsenal.
+FIND_BUDGET_ESCALATE_S = float(get_env("FIND_BUDGET_ESCALATE_S", "75") or 75)
 # Bounded genuine fallback after Apollo miss (web+harvest+scrape+github, MX-only).
 FIND_BUDGET_FALLBACK_S = float(get_env("FIND_BUDGET_FALLBACK_S", "8") or 8)
 # Hard cap for any single candidate verify inside the parallel pool, so one slow/blocked mailbox
@@ -1333,27 +1335,29 @@ def _score_candidate(cand: dict) -> tuple:
 def find(name: str, company: str = "", domain: str = "", github: str = "",
          linkedin_url: str = "", scrape: bool = True, deep: bool = False,
          use_agent: bool = False, use_extensions: bool = False,
-         refresh: bool = False) -> dict:
+         refresh: bool = False, fast_only: bool = False) -> dict:
     """Resolve the best free work email for a person (fast keyless waterfall, verified + ranked).
 
-    Fast modes return the full result inline (bounded by FIND_BUDGET_S — the SMTP circuit-breaker +
-    per-verify caps guarantee it never hangs). The genuinely-long modes (deep / use_agent /
-    use_extensions) return inline if quick, else a {job_id} you poll with find_status(job_id) — so a
-    long crawl never blocks or times out. Same result shape either way (best, candidates, summary).
+    Stage A (≤10s): learned pattern → finder APIs → scrape+web → evaluate. Returns immediately
+    when confident (high/medium). Stage B (≤75s, auto): fires when Stage A misses confidence
+    threshold — races the full arsenal (Wayback, harvest, CommonCrawl, theHarvester, OSINT,
+    deep BFS, webscrape, extension reveal) concurrently, short-circuits on first hit.
+    fast_only=True disables Stage B (Stage A only, quick best-effort).
     refresh=True bypasses all caches and re-resolves from scratch."""
-    # Fast keyless path: synchronous + budget-bounded (no client-facing job indirection).
+    # Fast keyless path (Stage A only): synchronous + budget-bounded.
     if not (deep or use_agent or use_extensions):
         return _find_core(name, company=company, domain=domain, github=github,
-                          linkedin_url=linkedin_url, scrape=scrape, refresh=refresh)
+                          linkedin_url=linkedin_url, scrape=scrape, refresh=refresh,
+                          fast_only=fast_only)
 
-    # Heavy path (crawl / agentic browsing / extension reveal): inline-if-quick, else background.
+    # Heavy path (crawl / agentic browsing / extension reveal / Stage B): inline-if-quick, else background.
     def _worker(job: dict) -> None:
         JOBS.set(job["id"], status="running", percent=5.0)
         try:
             res = _find_core(name, company=company, domain=domain, github=github,
                              linkedin_url=linkedin_url, scrape=scrape, deep=deep,
                              use_agent=use_agent, use_extensions=use_extensions,
-                             refresh=refresh)
+                             refresh=refresh, fast_only=fast_only)
         except Exception as e:  # noqa: BLE001 — never surface a raw error to the client
             JOBS.finish(job["id"], ok_=False, error=str(e))
             return
@@ -1420,7 +1424,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                use_agent: bool = False, use_extensions: bool = False,
                linkedin_candidates: list | None = None,
                apollo_seed: dict | None = None,
-               refresh: bool = False) -> dict:
+               refresh: bool = False, fast_only: bool = False) -> dict:
     """Resolve the best free work email for a person. Waterfall: learned pattern → Hunter/Tomba →
     site scrape → GitHub commits → parallel web search (8 engines) → Wayback → deep site harvest
     (sitemap/llms.txt/Cloudflare cfemail decode) → OSINT (PGP keyservers + crt.sh) → patterns.
@@ -1443,13 +1447,13 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
         if _cached_find:
             return _cached_find
 
-    # Negative-result cache: if this name+domain returned empty recently (and we're in the basic
-    # path), return the cached miss instantly instead of re-running the entire waterfall.
+    # Negative-result cache: if this name+domain returned empty recently (and we're on a non-refresh
+    # path), return the cached miss instantly instead of re-running the full escalation stack.
     if dom and not deep and not use_extensions and not use_agent and not refresh and _neg_cache_get(name, dom):
         return {"best": None, "confidence": "none", "cached_miss": True,
-                "note": "recent search found no email (negative cache); use deep=True to force retry",
+                "note": "recent search found no email (negative cache); use refresh=True to force retry",
                 "evidence": evidence,
-                "summary": f"Cached miss for {name} — no email found recently (retry with deep=True)"}
+                "summary": f"Cached miss for {name} — no email found recently (retry with refresh=True)"}
 
     # Wall-clock budget — find() must NEVER grind for minutes. Tight when driving the Apollo
     # extension (Apollo-first: if it has no card, fail fast rather than run the slow keyless crawl).
@@ -1652,7 +1656,174 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
             _find_cache_put(name, company, dom, result)
         return result
 
-    # 0) a previously-learned pattern for this domain (free, no API call, highest priority)
+    # ── Stage-B escalation helper ─────────────────────────────────────────────────────────────────
+    def _run_escalation() -> "dict | None":
+        """Concurrent arsenal race — fires when Stage A returns low/none confidence.
+        All sources race simultaneously under FIND_BUDGET_ESCALATE_S; as_completed drains them
+        and short-circuits (cancels the rest) on the first high/medium qualifying hit.
+        Adds candidates to `raw`; returns a result dict or None (fall through to final evaluate)."""
+        _esc_s = FIND_BUDGET_DEEP_S if deep else FIND_BUDGET_ESCALATE_S
+        try:
+            from mcp_base.deadline import Deadline as _EscDL
+            _EDL = _EscDL(_esc_s)
+        except Exception:  # noqa: BLE001
+            _EDL = None
+
+        evidence["escalation"] = {"budget_s": _esc_s, "sources_hit": []}
+
+        def _esc_add(em: str, src: str) -> None:
+            em = (em or "").strip().lower()
+            local = em.split("@", 1)[0].lower() if "@" in em else ""
+            if em and not _is_role(em) and ((first and first in local) or (last and last in local)):
+                _add(em, src)
+
+        # ── Sources ──────────────────────────────────────────────────────────────────────────────
+        def _s_wayback():
+            try:
+                return [("wayback", w["email"]) for w in
+                        (_wayback_emails(dom, name, max_snaps=3) or [])[:5]
+                        if not w.get("role")]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_harvest():
+            try:
+                return [("harvest", em) for em in
+                        (harvest.harvest_emails(dom, name=name, deadline=_EDL) or {})]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_commoncrawl():
+            try:
+                return [("commoncrawl", em) for em in
+                        (harvest.commoncrawl_emails(dom, name=name, deadline=_EDL) or {})]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_theharvester():
+            try:
+                return [("theharvester", em) for em in
+                        (harvest.theharvester_emails(dom, deadline=_EDL) or {})]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_osint():
+            try:
+                from mcp_base import osint_engines as _osi
+                out = []
+                for em in (_osi.pgp_search(name, domain=dom) or []):
+                    out.append(("pgp", em))
+                for em in (_osi.crtsh_emails(dom) or []):
+                    out.append(("crtsh", em))
+                return out
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_deep_fallback():
+            try:
+                df = harvest.deep_fallback(name, dom, company, deadline=_EDL)
+                return [("deep_crawl", c["email"]) for c in df.get("candidates", [])[:15]
+                        if c.get("email")]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_webscrape():
+            try:
+                from mcp_base import scrape as _scrape
+                out = []
+                for url in (harvest.discover_contact_pages(dom, deadline=_EDL) or [])[:4]:
+                    try:
+                        _pt = _EDL.op(6.0) if _EDL else 8.0
+                        r = fetch(url, timeout=_pt)
+                        if r.get("ok") and r.get("html"):
+                            ct = _scrape.contacts(r["html"])
+                            for item in (ct.get("emails") or []):
+                                em = (item.get("email") if isinstance(item, dict)
+                                      else str(item or "")).strip().lower()
+                                if em and "@" in em:
+                                    out.append(("webscrape", em))
+                    except Exception:  # noqa: BLE001
+                        continue
+                return out
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _s_extension_reveal():
+            try:
+                from mcp_base import apollo_cdp as _ap, cdp as _cdp
+                _ok, _ = _cdp.ensure_running()
+                if not _ok:
+                    evidence["escalation"]["chrome"] = "absent"
+                    return []
+                _li = linkedin_url or evidence.get("linkedin_url")
+                if not _li and (name or company or dom):
+                    _disc = _ap.find_linkedin_profile(
+                        (name or "").strip() or (company or dom),
+                        company=company or dom, role="")
+                    _li = (_disc.get("profiles") or [None])[0]
+                best = _ap.reveal(name=name, company=company, domain=dom,
+                                  linkedin_url=_li or "", deadline=_EDL)
+                return [("apollo-cdp", best["email"])] if best.get("email") else []
+            except Exception:  # noqa: BLE001
+                return []
+
+        # ── Concurrent race ───────────────────────────────────────────────────────────────────────
+        _esc_sources = [
+            ("wayback",          _s_wayback),
+            ("harvest_full",     _s_harvest),
+            ("commoncrawl",      _s_commoncrawl),
+            ("theharvester",     _s_theharvester),
+            ("osint",            _s_osint),
+            ("deep_fallback",    _s_deep_fallback),
+            ("webscrape",        _s_webscrape),
+            ("extension_reveal", _s_extension_reveal),
+        ]
+        _esc_pool = _cf.ThreadPoolExecutor(max_workers=10)
+        _esc_futs = {_esc_pool.submit(fn): sname for sname, fn in _esc_sources}
+        _esc_timeout = (_EDL.remaining() if _EDL is not None else _esc_s)
+
+        try:
+            for _ef in _cf.as_completed(_esc_futs, timeout=_esc_timeout):
+                _sname = _esc_futs[_ef]
+                try:
+                    hits = _ef.result(timeout=0.5) or []
+                    for _st, _em in hits:
+                        _esc_add(_em, _st)
+                    if hits:
+                        evidence["escalation"]["sources_hit"].append(_sname)
+                except Exception:  # noqa: BLE001
+                    pass
+                # Short-circuit: re-evaluate after each source lands
+                if raw:
+                    _ev = _evaluate(verify_cap=5, check_smtp=True)
+                    _et = _ev.get("top")
+                    _ec = (_et.get("confidence") or "none") if _et else "none"
+                    if _et and _qualifies(_et) and _ec in ("high", "medium"):
+                        for _xf in _esc_futs:
+                            _xf.cancel()
+                        evidence["escalation"]["short_circuit"] = _sname
+                        return _success(_et, _ev["out_candidates"])
+        except _cf.TimeoutError:
+            evidence["escalation"]["timed_out"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            _esc_pool.shutdown(wait=False, cancel_futures=True)
+
+        # Deep research: last resort after concurrent batch (240s subprocess — only with budget)
+        if dom and (deep or (_EDL is None or _EDL.remaining() > 60)):
+            try:
+                from mcp_base import agent_browse as _agent
+                _ar = _agent.browse_for_email(name, company=company, domain=dom)
+                if isinstance(_ar, dict):
+                    for _aem in (_ar.get("emails") or []):
+                        _esc_add(_aem, "agent")
+            except Exception:  # noqa: BLE001
+                pass
+
+        return None  # no short-circuit hit; fall through to patterns + final evaluate
+
+    # ── 0) a previously-learned pattern for this domain (free, no API call, highest priority)
     learned = _learned_pattern(dom) if dom else None
     if learned:
         rendered = _render_hunter_pattern(learned, first, last)
@@ -1920,134 +2091,26 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
         for e in (gh.get("emails", []) or [])[:3]:
             _add(e["email"], "github")
 
-    # --- Fast path: if the cheap/targeted steps already produced a verified extension hit or a
-    # verified on-domain address, return NOW and skip the slow waterfall (Wayback/harvest/OSINT).
+    # ── Stage-A fast path evaluate ────────────────────────────────────────────────────────────────
+    # If the cheap steps (learned pattern, finder APIs, scrape, web, GitHub) already produced a
+    # confident on-domain result, return NOW — the slow arsenal never fires for easy targets.
     _fast = _evaluate(verify_cap=5, check_smtp=_smtp_on())
-    if _qualifies(_fast["top"]):
+    _fast_top = _fast["top"]
+    _fast_conf = (_fast_top.get("confidence") or "none") if _fast_top else "none"
+    if _qualifies(_fast_top) and _fast_conf in ("high", "medium"):
         evidence["fast_path"] = True
-        return _success(_fast["top"], _fast["out_candidates"])
+        return _success(_fast_top, _fast["out_candidates"])
 
-    # Apollo / cheap-step fast path didn't land a confident answer → fall through to the GENUINE free
-    # keyless backbone so the pipeline still resolves a REAL email (never empty just because the
-    # optional Apollo reveal missed). For the extension path this is BOUNDED + fast: web search + site
-    # harvest + scrape + github + reveal under FIND_BUDGET_FALLBACK_S with MX-only verify, skipping the
-    # slow/low-yield Wayback + OSINT (those are reserved for deep=True). No fabricated guesses — only
-    # genuinely-sourced addresses; bare name+domain patterns stay clearly low/inconclusive.
-    if not _run_slow:
-        _run_slow = True
-        _ext_fallback = not deep   # bounded genuine fallback for the extension path
-        _budget = max(_budget, FIND_BUDGET_FALLBACK_S if _ext_fallback else FIND_BUDGET_S)
-        evidence["fell_through"] = ("extension miss → bounded genuine fallback"
-                                    if _ext_fallback else "extension miss → full free waterfall")
-
-    # 5) Wayback Machine archived about/team/contact pages (skipped in the bounded extension fallback)
-    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 6.0:
-        wb = _wayback_emails(dom, name, max_snaps=2)
-        if wb:
-            evidence["wayback"] = wb
-            for item in wb[:5]:
-                if not item["role"]:
-                    _add(item["email"], "wayback")
-
-    # 5.5) Deep site harvest: sitemap + llms.txt + Cloudflare cfemail decode.
-    # CommonCrawl + theHarvester are slow/high-noise — gate them behind deep=True only.
-    # harvest_emails always runs (it's the fast in-process sitemap path); the two opt-in slow
-    # sources (CommonCrawl, theHarvester) only fire when the user explicitly asked for deep=True.
-    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 5.0:
-        _harvest_all: dict[str, int] = {}
-        _harvest_timeout = max(2.0, _budget_remaining())
-
-        def _run_harvest_emails() -> dict:
-            try:
-                return harvest.harvest_emails(dom, name=name) or {}
-            except Exception:  # noqa: BLE001
-                return {}
-
-        def _run_commoncrawl() -> dict:
-            try:
-                return harvest.commoncrawl_emails(dom, name=name) or {}
-            except Exception:  # noqa: BLE001
-                return {}
-
-        def _run_theharvester() -> dict:
-            try:
-                return harvest.theharvester_emails(dom) or {}
-            except Exception:  # noqa: BLE001
-                return {}
-
-        _harvest_workers = 1 + (2 if deep else 0)
-        _harvest_pool = _cf.ThreadPoolExecutor(max_workers=_harvest_workers)
-        _harvest_futs = [_harvest_pool.submit(_run_harvest_emails)]
-        if deep:
-            _harvest_futs.append(_harvest_pool.submit(_run_commoncrawl))
-            _harvest_futs.append(_harvest_pool.submit(_run_theharvester))
-        try:
-            for _hf in _cf.as_completed(_harvest_futs, timeout=_harvest_timeout):
-                try:
-                    for em, weight in (_hf.result() or {}).items():
-                        _harvest_all[em] = max(_harvest_all.get(em, 0), weight)
-                except Exception:  # noqa: BLE001
-                    continue
-        except _cf.TimeoutError:
-            evidence["harvest_partial"] = True
-        finally:
-            _harvest_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _harvest_all:
-            evidence["harvest"] = list(_harvest_all.keys())[:10]
-            for em, weight in _harvest_all.items():
-                local = em.split("@", 1)[0].lower()
-                if not _is_role(em) and ((first and first in local) or (last and last in local)):
-                    _add(em, "harvest")
-                    _maybe_learn_pattern(em)
-
-    # 5.6) OSINT — PGP keyservers + crt.sh CT emails (skipped in the bounded extension fallback)
-    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 4.0:
-        try:
-            from mcp_base import osint_engines as _osint
-            pgp_emails = _osint.pgp_search(name, domain=dom)
-            if pgp_emails:
-                evidence["pgp"] = pgp_emails
-                for em in pgp_emails:
-                    _add(em, "pgp")
-            crt_emails = _osint.crtsh_emails(dom)
-            if crt_emails:
-                evidence["crtsh"] = crt_emails[:20]
-                for em in crt_emails:
-                    local = em.split("@", 1)[0].lower()
-                    if (first and first in local) or (last and last in local):
-                        _add(em, "crtsh")
-        except Exception:
-            pass
-    if _over_budget():
-        evidence["timed_out"] = True
-
-    # 5.7) deep fallback: BFS crawl + web search (only when deep=True)
-    if deep and dom:
-        try:
-            df = harvest.deep_fallback(name, dom, company)
-            evidence["deep_crawl"] = {"degraded": df.get("degraded", [])}
-            for cand in df.get("candidates", [])[:15]:
-                em = (cand.get("email") or "").strip().lower()
-                if em and not _is_role(em):
-                    _add(em, "deep_crawl")
-        except Exception:
-            pass
-
-    # 5.8) AI agentic browsing (opt-in) — observe→think→act over the real Chrome for hard cases
-    if use_agent and dom:
-        try:
-            from mcp_base import agent_browse as _agent
-            ar = _agent.browse_for_email(name, company=company, domain=dom)
-            if isinstance(ar, dict) and ar.get("emails"):
-                evidence["agent_browse"] = {"emails": ar["emails"][:10],
-                                            "note": ar.get("note")}
-                for em in ar["emails"]:
-                    em = (em or "").strip().lower()
-                    if em and "@" in em and not _is_role(em):
-                        _add(em, "agent")
-        except Exception:
-            pass
+    # ── Stage-B auto-escalation ────────────────────────────────────────────────────────────────
+    # Stage A didn't produce a confident result. Auto-escalate: race the full arsenal concurrently
+    # (Wayback, harvest, CommonCrawl, theHarvester, OSINT, deep BFS, webscrape, extension reveal).
+    # fast_only=True opts out (e.g. bulk_find's quick path). Extension/use_agent/deep params don't
+    # gate escalation anymore — confidence drives it.
+    if not fast_only:
+        evidence["stage_b"] = True
+        _esc_result = _run_escalation()
+        if _esc_result is not None:
+            return _esc_result
 
     # 6) generic name+domain patterns (fallback)
     if dom:
