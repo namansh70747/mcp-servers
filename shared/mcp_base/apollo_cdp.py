@@ -141,10 +141,52 @@ _LAST_PANEL_PERSON = ""
 # internally calls another locked helper doesn't deadlock.
 _CDP_LOCK = threading.RLock()
 
+# ── Persistent cache helpers (survive process restarts) ───────────────────────────────────────
+# Both people-search and discovery caches are now persisted to JSON sidecars in data_dir("email-finder").
+# Cache entries use time.time() (wall-clock) so timestamps survive restarts — contrast with the
+# per-operation deadline loops elsewhere in this file which correctly stay on time.monotonic().
+
+import os as _os
+import pathlib as _pathlib
+
+def _cache_dir() -> _pathlib.Path:
+    try:
+        return _pathlib.Path(data_dir("email-finder"))
+    except Exception:
+        return _pathlib.Path("/tmp")
+
+def _load_sidecar(fname: str, ttl: float) -> "dict[str, tuple[float, dict]]":
+    """Load a cache sidecar JSON, dropping entries older than ttl seconds."""
+    path = _cache_dir() / fname
+    try:
+        with open(path) as _f:
+            raw: dict = json.load(_f)
+        now = time.time()
+        return {k: (ts, v) for k, (ts, v) in (
+            (k, (float(row[0]), row[1])) for k, row in raw.items()
+        ) if (now - ts) < ttl}
+    except Exception:
+        return {}
+
+def _save_sidecar(fname: str, cache: "dict[str, tuple[float, dict]]") -> None:
+    """Atomically write cache to JSON sidecar (temp file + rename)."""
+    path = _cache_dir() / fname
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w") as _f:
+            json.dump({k: [ts, v] for k, (ts, v) in cache.items()}, _f)
+        _os.replace(tmp, path)
+    except Exception:
+        try:
+            _os.unlink(tmp)
+        except Exception:
+            pass
+
+
 # Cache for apollo_people_search keyed by (norm-company | domain, role). Company→people is stable
 # within a session, so repeats and bulk batches return instantly with no re-query. TTL ~1h.
-_PEOPLE_CACHE: dict[str, tuple[float, dict]] = {}
 _PEOPLE_TTL = 3600.0
+_PEOPLE_CACHE: dict[str, tuple[float, dict]] = _load_sidecar("apollo_people_cache.json", _PEOPLE_TTL)
 
 
 def _find_panel(ext_name: str = "apollo", want_slug: str = "", want_name: str = "",
@@ -497,8 +539,8 @@ def _reveal_with(ext_name: str, domain: str, li_target: dict | None,
 _LI_PROFILE_RE = re.compile(r"https?://([a-z]{2,3}\.)?linkedin\.com/in/[a-zA-Z0-9_%\-]+", re.I)
 _DISCOVERY_BUDGET_S = float(get_env("LI_DISCOVERY_BUDGET_S", "9") or 9)
 _SEARCH_SETTLE = {"bing": 1.3, "duck": 1.3, "linkedin": 2.6}
-_DISCOVERY_CACHE: dict[str, tuple[float, dict]] = {}   # query → (ts, result)
 _DISCOVERY_TTL = 3600.0
+_DISCOVERY_CACHE: dict[str, tuple[float, dict]] = _load_sidecar("apollo_discovery_cache.json", _DISCOVERY_TTL)
 
 
 def _scratch_tab(seed: str) -> dict | None:
@@ -676,7 +718,7 @@ def find_linkedin_profile(query: str, company: str = "", role: str = "",
     # In-process cache (the server is long-lived): a repeat company→profile lookup is instant.
     _ck = q.lower()
     _hit = _DISCOVERY_CACHE.get(_ck)
-    if _hit and (time.monotonic() - _hit[0]) < _DISCOVERY_TTL:
+    if _hit and (time.time() - _hit[0]) < _DISCOVERY_TTL:
         return {**_hit[1], "cached": True}
 
     ok, why = cdp.ensure_running()
@@ -733,7 +775,9 @@ def find_linkedin_profile(query: str, company: str = "", role: str = "",
                 except Exception:
                     pass
             result["source"] = "web" if web_profiles else "linkedin"
-            _DISCOVERY_CACHE[_ck] = (time.monotonic(), result)
+            _DISCOVERY_CACHE[_ck] = (time.time(), result)
+            with _CDP_LOCK:
+                _save_sidecar("apollo_discovery_cache.json", _DISCOVERY_CACHE)
             return result
     else:
         result["degraded"].append(f"cdp:unreachable:{why}")
@@ -752,7 +796,9 @@ def find_linkedin_profile(query: str, company: str = "", role: str = "",
             result["profiles"] = result["profiles"][:limit]
             result["top"] = result["profiles"][0]
             result["source"] = "keyless"
-            _DISCOVERY_CACHE[_ck] = (time.monotonic(), result)
+            _DISCOVERY_CACHE[_ck] = (time.time(), result)
+            with _CDP_LOCK:
+                _save_sidecar("apollo_discovery_cache.json", _DISCOVERY_CACHE)
             return result
     except Exception as e:  # noqa: BLE001
         result["degraded"].append(f"keyless:error:{str(e)[:40]}")
@@ -1392,16 +1438,17 @@ def apollo_people_search(domain: str, role: str = "CEO", company: str = "",
     Returns {ok, people:[...], matched_by, canonical_domain, degraded}."""
     ck = f"{_norm(company)}|{(domain or '').strip().lower().lstrip('@')}|{(role or '').strip().lower()}"
     hit = _PEOPLE_CACHE.get(ck)
-    if hit and (time.monotonic() - hit[0]) < _PEOPLE_TTL:
+    if hit and (time.time() - hit[0]) < _PEOPLE_TTL:
         return {**hit[1], "cached": True}
     with _CDP_LOCK:
         # re-check inside the lock — a concurrent caller may have just populated it
         hit = _PEOPLE_CACHE.get(ck)
-        if hit and (time.monotonic() - hit[0]) < _PEOPLE_TTL:
+        if hit and (time.time() - hit[0]) < _PEOPLE_TTL:
             return {**hit[1], "cached": True}
         res = _apollo_people_search_impl(domain, role=role, company=company, per_page=per_page)
         if res.get("ok"):  # cache only positive results; misses stay cheap to retry
-            _PEOPLE_CACHE[ck] = (time.monotonic(), res)
+            _PEOPLE_CACHE[ck] = (time.time(), res)
+            _save_sidecar("apollo_people_cache.json", _PEOPLE_CACHE)
         return res
 
 
