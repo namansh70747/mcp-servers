@@ -15,6 +15,7 @@ import random
 import re
 import smtplib
 import string
+import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -483,15 +484,28 @@ def scrape_site(domain: str, max_pages: int = 5) -> dict:
     found: dict[str, int] = {}
     pages_hit = 0
     _deadline = _time.monotonic() + SCRAPE_BUDGET_S  # overall wall-clock guard
-    for path in paths[:max_pages]:
-        if _time.monotonic() > _deadline:
-            break
-        html = _fetch_page_text(base.rstrip("/") + path)
-        if not html:
-            continue
-        pages_hit += 1
-        for em, w in _emails_from_html(html).items():
-            found[em] = found.get(em, 0) + w
+
+    def _fetch_path(path: str) -> tuple[str, str]:
+        return path, _fetch_page_text(base.rstrip("/") + path) or ""
+
+    with _cf.ThreadPoolExecutor(max_workers=5) as _sp:
+        _futs = {_sp.submit(_fetch_path, p): p for p in paths[:max_pages]}
+        remaining = max(1.0, _deadline - _time.monotonic())
+        try:
+            for _fut in _cf.as_completed(_futs, timeout=remaining):
+                if _time.monotonic() > _deadline:
+                    break
+                try:
+                    _, html = _fut.result()
+                except Exception:
+                    continue
+                if not html:
+                    continue
+                pages_hit += 1
+                for em, w in _emails_from_html(html).items():
+                    found[em] = found.get(em, 0) + w
+        except _cf.TimeoutError:
+            pass
     on_domain = {e: n for e, n in found.items() if e.split("@")[-1].lower().endswith(host)}
     ranked = sorted((on_domain or found).items(), key=lambda kv: -kv[1])
     return {"domain": host, "pages_scanned": pages_hit,
@@ -1378,6 +1392,9 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
     def _over_budget() -> bool:
         return (_time.monotonic() - _t0) > _budget
 
+    def _budget_remaining() -> float:
+        return max(0.0, _budget - (_time.monotonic() - _t0))
+
     def _add(email: str, source: str) -> None:
         email = (email or "").strip().lower()
         if email and "@" in email and not _is_disposable(email.split("@", 1)[1]):
@@ -1752,7 +1769,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
 
         # LinkedIn→email (Prospeo) — credit-independent reveal alt for the discovered profile
         _li = linkedin_url or evidence.get("linkedin_url")
-        if _li and get_env("PROSPEO_API_KEY") and not _over_budget():
+        if _li and get_env("PROSPEO_API_KEY") and _budget_remaining() >= 6.0:
             try:
                 _pl = prospeo_find_by_linkedin(_li)
                 evidence["prospeo_linkedin"] = _pl
@@ -1800,8 +1817,8 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
     # Slow keyless waterfall (steps 4–5.6), each gated by the wall-clock budget so it can never grind.
 
     # 4) free multi-engine web search anywhere on the web (capped by the remaining find budget)
-    if _run_slow and not _over_budget():
-        _remain = max(4.0, _budget - (_time.monotonic() - _t0))
+    if _run_slow and _budget_remaining() >= 4.0:
+        _remain = _budget_remaining()
         web = _web_search_emails(name, dom, company, budget_s=_remain)
         if web:
             evidence["web"] = web
@@ -1810,7 +1827,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                     _add(item["email"], "web")
 
     # 5) Wayback Machine archived about/team/contact pages (skipped in the bounded extension fallback)
-    if _run_slow and not _ext_fallback and dom and not _over_budget():
+    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 6.0:
         wb = _wayback_emails(dom, name, max_snaps=2)
         if wb:
             evidence["wayback"] = wb
@@ -1822,7 +1839,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
     # ~unlimited web archive) + theHarvester OSINT (if installed). Skipped in the bounded extension
     # fallback (reserved for deep=True / non-extension).
     # All 3 sources run IN PARALLEL now (was sequential — could take 240s+, now ~20-30s wall-clock).
-    if _run_slow and not _ext_fallback and dom and not _over_budget():
+    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 5.0:
         _harvest_all: dict[str, int] = {}
         _harvest_deadline = _t0 + _budget
         _harvest_timeout = max(2.0, _harvest_deadline - _time.monotonic())
@@ -1872,7 +1889,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                     _maybe_learn_pattern(em)
 
     # 5.6) OSINT — PGP keyservers + crt.sh CT emails (skipped in the bounded extension fallback)
-    if _run_slow and not _ext_fallback and dom and not _over_budget():
+    if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 4.0:
         try:
             from mcp_base import osint_engines as _osint
             pgp_emails = _osint.pgp_search(name, domain=dom)
@@ -2195,6 +2212,7 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
     # 50-item batch: was ~37min sequential → ~4-5min parallel.
     # Mutable state shared across the resolve workers (avoids nonlocal in threads).
     _state = {"credits_used": 0, "credits_exhausted": False}
+    _state_lock = threading.Lock()   # atomic credit counter under parallel use_extensions=False path
 
     def _resolve_one(i: int) -> None:
         it = items[i]
@@ -2213,7 +2231,8 @@ def _bulk_core(people: list, use_extensions: bool, role: str, persist: bool,
             if any("exhaust" in str(d) or "all-credits" in str(d) for d in ap.get("degraded", [])):
                 _state["credits_exhausted"] = True
             if ap.get("credit_used"):
-                _state["credits_used"] += 1
+                with _state_lock:
+                    _state["credits_used"] += 1
             status = ("found" if best
                       else ("unresolved" if use_extensions and not it.get("linkedin_url")
                             else "no-email"))

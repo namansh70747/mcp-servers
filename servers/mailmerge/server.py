@@ -312,16 +312,25 @@ def render_batch(recipients: list[dict], template_name: str, common: dict | None
             skipped.append({"row": i, "to_email": email, "reason": "invalid/missing email"})
             continue
         missing_vars = sorted(v for v in required if not str(ctx.get(v, "")).strip())
-        subject, body = _split_subject(tmpl.render(**ctx))
+        try:
+            rendered = tmpl.render(**ctx)
+        except Exception as render_err:
+            skipped.append({"row": i, "to_email": email, "reason": f"render error: {render_err}"})
+            continue
+        subject, body = _split_subject(rendered)
         payloads.append({
             "to_email": email, "subject": subject, "body": body,
             "recipient_name": r.get("name") or r.get("recipient_name", ""),
             "company": r.get("company", ""), "role": r.get("role", ""),
-            "template_used": template_name, "missing_vars": missing_vars,
+            "template_used": template_name,
+            "_diagnostics": {"missing_vars": missing_vars},
         })
     return {"ready": len(payloads), "skipped": skipped, "payloads": payloads,
-            "next_action": "For each payload call reachout.create_draft(**payload-fields), review, "
-                           "then reachout.send_draft. Respect reachout's daily cap + cooldown."}
+            "next_action": (
+                "For each payload call reachout.create_draft(**{k:v for k,v in payload.items() "
+                "if not k.startswith('_')}), review, then reachout.send_draft. "
+                "Respect reachout's daily cap + cooldown."
+            )}
 
 
 @mcp.tool

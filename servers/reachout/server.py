@@ -292,7 +292,7 @@ def create_draft(to_email: str, subject: str, body: str, recipient_name: str = "
                  company: str = "", role: str = "", template_used: str = "",
                  attachments: list[str] | None = None, attach_onepager: str = "",
                  variant: str = "", sequence_id: int | None = None, step: int = 0,
-                 contact_id: int | None = None) -> dict:
+                 contact_id: int | None = None, **_ignored) -> dict:
     """Create a Gmail DRAFT (nothing sent) and log it. The safe default path — review, then send_draft.
     `attach_onepager` is a convenience path appended to attachments. Records an event + variant.
     Optional `contact_id` links this outreach to a contacts-server record (P2 cross-server identity)."""
