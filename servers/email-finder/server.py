@@ -76,10 +76,11 @@ NEG_CACHE_TTL_S = 6 * 3600  # 6h negative-result cache (same name+domain returne
 # Hard wall-clock budget for find() so it can NEVER grind for minutes. The slow keyless waterfall
 # (web/Wayback/harvest/OSINT) is skipped once exceeded. Tighter when driving the Apollo extension.
 # Parallelised finder waterfall means 45s → 25s covers the same work.
-FIND_BUDGET_S = float(get_env("FIND_BUDGET_S", "25") or 25)
-FIND_BUDGET_EXT_S = float(get_env("FIND_BUDGET_EXT_S", "20") or 20)
+FIND_BUDGET_S = float(get_env("FIND_BUDGET_S", "10") or 10)
+FIND_BUDGET_EXT_S = float(get_env("FIND_BUDGET_EXT_S", "12") or 12)
+FIND_BUDGET_DEEP_S = float(get_env("FIND_BUDGET_DEEP_S", "90") or 90)
 # Bounded genuine fallback after Apollo miss (web+harvest+scrape+github, MX-only).
-FIND_BUDGET_FALLBACK_S = float(get_env("FIND_BUDGET_FALLBACK_S", "15") or 15)
+FIND_BUDGET_FALLBACK_S = float(get_env("FIND_BUDGET_FALLBACK_S", "8") or 8)
 # Hard cap for any single candidate verify inside the parallel pool, so one slow/blocked mailbox
 # can never stall the find() budget. A timeout → honest deliverable=None.
 PER_VERIFY_S = float(get_env("EMAIL_PER_VERIFY_S", "8") or 8)
@@ -1270,17 +1271,19 @@ def _score_candidate(cand: dict) -> tuple:
 @mcp.tool
 def find(name: str, company: str = "", domain: str = "", github: str = "",
          linkedin_url: str = "", scrape: bool = True, deep: bool = False,
-         use_agent: bool = False, use_extensions: bool = False) -> dict:
+         use_agent: bool = False, use_extensions: bool = False,
+         refresh: bool = False) -> dict:
     """Resolve the best free work email for a person (fast keyless waterfall, verified + ranked).
 
     Fast modes return the full result inline (bounded by FIND_BUDGET_S — the SMTP circuit-breaker +
     per-verify caps guarantee it never hangs). The genuinely-long modes (deep / use_agent /
     use_extensions) return inline if quick, else a {job_id} you poll with find_status(job_id) — so a
-    long crawl never blocks or times out. Same result shape either way (best, candidates, summary)."""
+    long crawl never blocks or times out. Same result shape either way (best, candidates, summary).
+    refresh=True bypasses all caches and re-resolves from scratch."""
     # Fast keyless path: synchronous + budget-bounded (no client-facing job indirection).
     if not (deep or use_agent or use_extensions):
         return _find_core(name, company=company, domain=domain, github=github,
-                          linkedin_url=linkedin_url, scrape=scrape)
+                          linkedin_url=linkedin_url, scrape=scrape, refresh=refresh)
 
     # Heavy path (crawl / agentic browsing / extension reveal): inline-if-quick, else background.
     def _worker(job: dict) -> None:
@@ -1288,7 +1291,8 @@ def find(name: str, company: str = "", domain: str = "", github: str = "",
         try:
             res = _find_core(name, company=company, domain=domain, github=github,
                              linkedin_url=linkedin_url, scrape=scrape, deep=deep,
-                             use_agent=use_agent, use_extensions=use_extensions)
+                             use_agent=use_agent, use_extensions=use_extensions,
+                             refresh=refresh)
         except Exception as e:  # noqa: BLE001 — never surface a raw error to the client
             JOBS.finish(job["id"], ok_=False, error=str(e))
             return
@@ -1354,7 +1358,8 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                linkedin_url: str = "", scrape: bool = True, deep: bool = False,
                use_agent: bool = False, use_extensions: bool = False,
                linkedin_candidates: list | None = None,
-               apollo_seed: dict | None = None) -> dict:
+               apollo_seed: dict | None = None,
+               refresh: bool = False) -> dict:
     """Resolve the best free work email for a person. Waterfall: learned pattern → Hunter/Tomba →
     site scrape → GitHub commits → parallel web search (8 engines) → Wayback → deep site harvest
     (sitemap/llms.txt/Cloudflare cfemail decode) → OSINT (PGP keyservers + crt.sh) → patterns.
@@ -1380,8 +1385,18 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
 
     # Wall-clock budget — find() must NEVER grind for minutes. Tight when driving the Apollo
     # extension (Apollo-first: if it has no card, fail fast rather than run the slow keyless crawl).
+    # deep=True gets a generous budget (90s); extension path is tight (12s); default fast path 10s.
     _t0 = _time.monotonic()
-    _budget = FIND_BUDGET_EXT_S if (use_extensions and not deep) else FIND_BUDGET_S
+    _budget = (FIND_BUDGET_DEEP_S if deep
+               else FIND_BUDGET_EXT_S if (use_extensions and not deep)
+               else FIND_BUDGET_S)
+    # Hard Deadline object — every op inside uses _DL.op(default) so nothing can slip past the cap.
+    try:
+        from mcp_base.deadline import Deadline as _FindDL
+        _DL = _FindDL(_budget)
+    except Exception:
+        _DL = None  # safety fallback — won't happen after Tier 0
+
     # The slow keyless waterfall (web/Wayback/harvest/OSINT) runs only when NOT Apollo-driven, or
     # explicitly deep=True. Apollo misses return fast on the cheap targeted steps + patterns.
     _run_slow = (not use_extensions) or deep
@@ -1393,10 +1408,10 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
         return _run_slow and not _ext_fallback
 
     def _over_budget() -> bool:
-        return (_time.monotonic() - _t0) > _budget
+        return _DL.expired() if _DL is not None else ((_time.monotonic() - _t0) > _budget)
 
     def _budget_remaining() -> float:
-        return max(0.0, _budget - (_time.monotonic() - _t0))
+        return _DL.remaining() if _DL is not None else max(0.0, _budget - (_time.monotonic() - _t0))
 
     def _add(email: str, source: str) -> None:
         email = (email or "").strip().lower()
@@ -1436,13 +1451,13 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
         _verify_order = order[:verify_cap]
 
         def _do_verify(em: str) -> tuple[str, dict]:
-            return em, verify(em, check_smtp=check_smtp)
+            # Pass the find-level deadline so each verify() call can never outlast the find budget.
+            return em, emailverify.verify(em, check_smtp=check_smtp,
+                                          deadline=_DL, budget_s=PER_VERIFY_S)
 
-        # Bound the verify pool so one slow mailbox can't blow find()'s budget: each verify is
-        # capped at PER_VERIFY_S, and the whole pool is capped by the time left in the find budget.
+        # Bound the verify pool so one slow mailbox can't blow find()'s budget.
         _vresults: dict[str, dict] = {}
-        _pool_deadline = _t0 + _budget
-        _overall = max(2.0, _pool_deadline - _time.monotonic())
+        _overall = max(2.0, _budget_remaining())
         # NOTE: don't use `with` — its exit calls shutdown(wait=True) and would block on a hung
         # verify, defeating the timeout. Drain via as_completed(timeout=_overall), then shut down
         # without waiting (cancel_futures) so a slow mailbox can never stall the caller.
@@ -1781,14 +1796,51 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
             except Exception:  # noqa: BLE001
                 pass
 
-    # 2) company site (published address matching the person)
-    if scrape and dom:
-        site = scrape_site(dom)
-        evidence["site"] = site
-        for item in site.get("emails", []):
-            local = item["email"].split("@", 1)[0].lower()
-            if not item["role"] and ((first and first in local) or (last and last in local)):
-                _add(item["email"], "site")
+        # Early gate: if the finder API pool already produced a confident on-domain result,
+        # return immediately — skip site scrape + GitHub + slow waterfall entirely.
+        if raw and not _over_budget():
+            _finder_fast = _evaluate(verify_cap=3, check_smtp=_smtp_on())
+            if _qualifies(_finder_fast["top"]):
+                evidence["finder_fast_path"] = True
+                return _success(_finder_fast["top"], _finder_fast["out_candidates"])
+
+    # 2+4) scrape_site ∥ web_search — run concurrently so both complete in max(scrape, search) time.
+    # Step 2 (site scrape) and step 4 (web search) are independent; parallelising them saves the
+    # sum-of-timeouts and lets the fast-path evaluate fire as soon as the first hit arrives.
+    _run_web = _run_slow and _budget_remaining() >= 4.0
+    if (scrape and dom) or _run_web:
+        _s24_budget = _budget_remaining()
+        _s24_pool = _cf.ThreadPoolExecutor(max_workers=2)
+        _s24_futs: dict = {}
+        if scrape and dom:
+            _s24_futs[_s24_pool.submit(scrape_site, dom)] = "scrape"
+        if _run_web:
+            _s24_futs[_s24_pool.submit(_web_search_emails, name, dom, company,
+                                        budget_s=max(2.0, _s24_budget))] = "web"
+        try:
+            for _s24f in _cf.as_completed(_s24_futs, timeout=max(2.0, _s24_budget)):
+                _s24key = _s24_futs[_s24f]
+                try:
+                    _s24r = _s24f.result()
+                    if _s24key == "scrape":
+                        _site = _s24r or {}
+                        evidence["site"] = _site
+                        for item in (_site.get("emails") or []):
+                            local = item["email"].split("@", 1)[0].lower()
+                            if not item["role"] and ((first and first in local)
+                                                     or (last and last in local)):
+                                _add(item["email"], "site")
+                    elif _s24key == "web" and _s24r:
+                        evidence["web"] = _s24r
+                        for item in (_s24r or [])[:5]:
+                            if not item["role"]:
+                                _add(item["email"], "web")
+                except Exception:
+                    pass
+        except _cf.TimeoutError:
+            evidence["scrape_web_partial"] = True
+        finally:
+            _s24_pool.shutdown(wait=False, cancel_futures=True)
 
     # 3) GitHub commit emails (often the real address directly)
     if github:
@@ -1798,7 +1850,7 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
             _add(e["email"], "github")
 
     # --- Fast path: if the cheap/targeted steps already produced a verified extension hit or a
-    # verified on-domain address, return NOW and skip the slow waterfall (web/Wayback/harvest/OSINT).
+    # verified on-domain address, return NOW and skip the slow waterfall (Wayback/harvest/OSINT).
     _fast = _evaluate(verify_cap=5, check_smtp=_smtp_on())
     if _qualifies(_fast["top"]):
         evidence["fast_path"] = True
@@ -1817,18 +1869,6 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
         evidence["fell_through"] = ("extension miss → bounded genuine fallback"
                                     if _ext_fallback else "extension miss → full free waterfall")
 
-    # Slow keyless waterfall (steps 4–5.6), each gated by the wall-clock budget so it can never grind.
-
-    # 4) free multi-engine web search anywhere on the web (capped by the remaining find budget)
-    if _run_slow and _budget_remaining() >= 4.0:
-        _remain = _budget_remaining()
-        web = _web_search_emails(name, dom, company, budget_s=_remain)
-        if web:
-            evidence["web"] = web
-            for item in web[:5]:
-                if not item["role"]:
-                    _add(item["email"], "web")
-
     # 5) Wayback Machine archived about/team/contact pages (skipped in the bounded extension fallback)
     if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 6.0:
         wb = _wayback_emails(dom, name, max_snaps=2)
@@ -1838,14 +1878,13 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
                 if not item["role"]:
                     _add(item["email"], "wayback")
 
-    # 5.5) Deep site harvest: sitemap + llms.txt + Cloudflare cfemail decode + Common Crawl (free
-    # ~unlimited web archive) + theHarvester OSINT (if installed). Skipped in the bounded extension
-    # fallback (reserved for deep=True / non-extension).
-    # All 3 sources run IN PARALLEL now (was sequential — could take 240s+, now ~20-30s wall-clock).
+    # 5.5) Deep site harvest: sitemap + llms.txt + Cloudflare cfemail decode.
+    # CommonCrawl + theHarvester are slow/high-noise — gate them behind deep=True only.
+    # harvest_emails always runs (it's the fast in-process sitemap path); the two opt-in slow
+    # sources (CommonCrawl, theHarvester) only fire when the user explicitly asked for deep=True.
     if _run_slow and not _ext_fallback and dom and _budget_remaining() >= 5.0:
         _harvest_all: dict[str, int] = {}
-        _harvest_deadline = _t0 + _budget
-        _harvest_timeout = max(2.0, _harvest_deadline - _time.monotonic())
+        _harvest_timeout = max(2.0, _budget_remaining())
 
         def _run_harvest_emails() -> dict:
             try:
@@ -1865,12 +1904,12 @@ def _find_core(name: str, company: str = "", domain: str = "", github: str = "",
             except Exception:  # noqa: BLE001
                 return {}
 
-        _harvest_pool = _cf.ThreadPoolExecutor(max_workers=3)
-        _harvest_futs = [
-            _harvest_pool.submit(_run_harvest_emails),
-            _harvest_pool.submit(_run_commoncrawl),
-            _harvest_pool.submit(_run_theharvester),
-        ]
+        _harvest_workers = 1 + (2 if deep else 0)
+        _harvest_pool = _cf.ThreadPoolExecutor(max_workers=_harvest_workers)
+        _harvest_futs = [_harvest_pool.submit(_run_harvest_emails)]
+        if deep:
+            _harvest_futs.append(_harvest_pool.submit(_run_commoncrawl))
+            _harvest_futs.append(_harvest_pool.submit(_run_theharvester))
         try:
             for _hf in _cf.as_completed(_harvest_futs, timeout=_harvest_timeout):
                 try:
