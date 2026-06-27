@@ -95,7 +95,7 @@ _RATE = RateLimiter(min_interval=0.5)
 # Contact page discovery
 # ---------------------------------------------------------------------------
 
-def discover_contact_pages(domain: str) -> list[str]:
+def discover_contact_pages(domain: str, deadline=None) -> list[str]:
     """Return probable contact/team/about page URLs for a domain.
 
     Sources: default path list + sitemap.xml + llms.txt
@@ -115,7 +115,8 @@ def discover_contact_pages(domain: str) -> list[str]:
 
     # llms.txt
     try:
-        r = fetch(base + "/llms.txt", timeout=8.0)
+        _llms_t = deadline.op(8.0) if deadline is not None else 8.0
+        r = fetch(base + "/llms.txt", timeout=_llms_t)
         if r.get("ok") and r.get("html"):
             for line in r["html"].splitlines():
                 line = line.strip()
@@ -162,16 +163,17 @@ def _parse_sitemap(sitemap_url: str, depth: int = 0) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def harvest_emails(domain: str, name: str | None = None,
-                   render_js: bool = False) -> dict[str, int]:
+                   render_js: bool = False, deadline=None) -> dict[str, int]:
     """Fetch all contact pages and extract emails.
 
     Returns {email: weight} (see email_extract.extract_emails for weight semantics).
     Fetches up to 6 pages IN PARALLEL (was serial — saves ~4× wall-clock time).
     Optionally filters to only emails matching `name` pattern.
+    `deadline` (optional Deadline) caps the total wall-clock time.
     """
     import concurrent.futures as _cf_h
     import threading
-    pages = discover_contact_pages(domain)
+    pages = discover_contact_pages(domain, deadline=deadline)
     combined: dict[str, int] = {}
     _lock = threading.Lock()
 
@@ -179,12 +181,14 @@ def harvest_emails(domain: str, name: str | None = None,
         # Conditional-GET: if we have a cached ETag/Last-Modified, send it and skip re-extraction on 304.
         _RATE.wait(url)
         cached_etag, cached_mod, cached_emails = _HARVEST_CACHE.get(url)
-        r_raw = fetch(url, timeout=15.0, etag=cached_etag, modified=cached_mod)
+        _page_t = deadline.op(12.0) if deadline is not None else 15.0
+        r_raw = fetch(url, timeout=_page_t, etag=cached_etag, modified=cached_mod)
         if r_raw.get("not_modified") and cached_emails:
             return cached_emails  # 304 — page unchanged, reuse
         html = r_raw.get("html", "") if r_raw.get("ok") else ""
-        # JS render fallback for thin SPA shells
-        if not html or (len(html) < 2000 and html.count(" ") < 100):
+        # JS render fallback for thin SPA shells — only when deadline allows
+        _allow_render = (deadline is None or deadline.remaining() > 8)
+        if _allow_render and (not html or (len(html) < 2000 and html.count(" ") < 100)):
             try:
                 js_html = _playwright_render(url)
                 if js_html and len(js_html) > len(html):
@@ -207,10 +211,11 @@ def harvest_emails(domain: str, name: str | None = None,
         return found
 
     # Parallel fetch of contact pages (capped at 6 to avoid runaway).
+    _pool_timeout = deadline.op(60.0) if deadline is not None else 90.0
     with _cf_h.ThreadPoolExecutor(max_workers=6) as _pool:
         for future in _cf_h.as_completed(
             [_pool.submit(_fetch_and_extract, url) for url in pages[:6]],
-            timeout=90.0,
+            timeout=_pool_timeout,
         ):
             try:
                 for email, weight in (future.result() or {}).items():
@@ -221,18 +226,20 @@ def harvest_emails(domain: str, name: str | None = None,
 
     # Also check for PDF links on the home page.
     try:
-        home_r = fetch(f"https://{domain}/", timeout=10.0)
-        if home_r.get("ok") and home_r.get("html"):
-            pdf_emails = _harvest_pdfs(home_r["html"], f"https://{domain}/")
-            for e, w in pdf_emails.items():
-                combined[e] = max(combined.get(e, 0), w)
+        if deadline is None or deadline.remaining() > 5:
+            _home_t = deadline.op(8.0) if deadline is not None else 10.0
+            home_r = fetch(f"https://{domain}/", timeout=_home_t)
+            if home_r.get("ok") and home_r.get("html"):
+                pdf_emails = _harvest_pdfs(home_r["html"], f"https://{domain}/")
+                for e, w in pdf_emails.items():
+                    combined[e] = max(combined.get(e, 0), w)
     except Exception:
         pass
 
     return combined
 
 
-def commoncrawl_emails(domain: str, name: str | None = None, max_records: int = 12) -> dict[str, int]:
+def commoncrawl_emails(domain: str, name: str | None = None, max_records: int = 12, deadline=None) -> dict[str, int]:
     """Harvest emails for a domain from the **Common Crawl** index — FREE, no key, ~unlimited (a
     100B+ page web archive). Queries the latest CC index for captured pages on the domain, fetches the
     archived HTML from the free S3 bucket via a ranged GET (WARC offset), and extracts emails. A big
@@ -245,14 +252,16 @@ def commoncrawl_emails(domain: str, name: str | None = None, max_records: int = 
     out: dict[str, int] = {}
     try:
         import httpx
-        info = httpx.get("https://index.commoncrawl.org/collinfo.json", timeout=15,
+        _t_info = deadline.op(12.0) if deadline is not None else 15
+        info = httpx.get("https://index.commoncrawl.org/collinfo.json", timeout=_t_info,
                          follow_redirects=True).json()
         cdx_api = (info[0] or {}).get("cdx-api") if isinstance(info, list) and info else None
         if not cdx_api:
             return out
+        _t_cdx = deadline.op(20.0) if deadline is not None else 25
         r = httpx.get(cdx_api, params={"url": f"{dom}/*", "output": "json", "limit": 100,
                                        "filter": "status:200", "fl": "url,filename,offset,length,mime"},
-                      timeout=25, follow_redirects=True)
+                      timeout=_t_cdx, follow_redirects=True)
         records = []
         for line in r.text.splitlines():
             try:
@@ -279,19 +288,21 @@ def commoncrawl_emails(domain: str, name: str | None = None, max_records: int = 
                 return {}
             try:
                 off, ln = int(j["offset"]), int(j["length"])
+                _t_warc = deadline.op(15.0) if deadline is not None else 20
                 rr = httpx.get(f"https://data.commoncrawl.org/{j['filename']}",
                                headers={"Range": f"bytes={off}-{off + ln - 1}"},
-                               timeout=20, follow_redirects=True)
+                               timeout=_t_warc, follow_redirects=True)
                 text = gzip.decompress(rr.content).decode("utf-8", "ignore")
                 body = text.split("\r\n\r\n", 2)[-1]  # WARC hdrs → HTTP hdrs → body
                 return extract_emails(body, domain_filter=None)
             except Exception:  # noqa: BLE001
                 return {}
 
+        _cc_pool_t = deadline.op(50.0) if deadline is not None else 60.0
         with _cf_cc.ThreadPoolExecutor(max_workers=6) as _pool_cc:
             for _fut_cc in _cf_cc.as_completed(
                 [_pool_cc.submit(_fetch_cc_record, j) for j in records[:max_records]],
-                timeout=60.0,
+                timeout=_cc_pool_t,
             ):
                 try:
                     for e, w in (_fut_cc.result() or {}).items():
@@ -310,7 +321,7 @@ def commoncrawl_emails(domain: str, name: str | None = None, max_records: int = 
     return out
 
 
-def theharvester_emails(domain: str, timeout_s: float = 40.0) -> dict[str, int]:
+def theharvester_emails(domain: str, timeout_s: float = 40.0, deadline=None) -> dict[str, int]:
     """Run theHarvester (OSINT email harvester) for a domain IF the `theHarvester` binary is installed
     — aggregates many free public sources. Returns {email: weight}; {} if not installed. Never raises."""
     import json as _json
@@ -320,6 +331,9 @@ def theharvester_emails(domain: str, timeout_s: float = 40.0) -> dict[str, int]:
     dom = (domain or "").strip().lower().lstrip("@")
     if not dom or not shutil.which("theHarvester"):
         return {}
+    # Clamp subprocess timeout to the remaining deadline budget
+    if deadline is not None:
+        timeout_s = deadline.op(timeout_s)
     out: dict[str, int] = {}
     try:
         with tempfile.NamedTemporaryFile(suffix=".json", delete=True) as tf:
@@ -408,7 +422,7 @@ def _harvest_pdfs(html: str, base_url: str) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 def deep_fallback(name: str, domain: str | None, company: str | None,
-                  extra_queries: list[str] | None = None) -> dict:
+                  extra_queries: list[str] | None = None, deadline=None) -> dict:
     """Last-resort: web search + BFS crawl + site map + web engine.
 
     Returns {candidates: [{email, score, source}], degraded: [str]}.
@@ -433,9 +447,14 @@ def deep_fallback(name: str, domain: str | None, company: str | None,
 
     # Web search queries
     for q in queries[:5]:
+        if deadline is not None and deadline.expired():
+            degraded.append("search_queries:deadline_expired")
+            break
         try:
             links = search_links(q, n=5)
             for url in links:
+                if deadline is not None and deadline.expired():
+                    break
                 _RATE.wait(url)
                 html = _fetch_page(url, render_js=False) or ""
                 domain_filter = domain if domain else None
@@ -449,9 +468,9 @@ def deep_fallback(name: str, domain: str | None, company: str | None,
             degraded.append(f"search_query:error:{str(e)[:40]}")
 
     # Direct site BFS crawl
-    if domain:
+    if domain and (deadline is None or deadline.remaining() > 5):
         try:
-            bfs_emails = _bfs_crawl(domain)
+            bfs_emails = _bfs_crawl(domain, deadline=deadline)
             for email, weight in bfs_emails.items():
                 if email not in candidates:
                     candidates[email] = {"email": email, "score": weight * 4, "source": "site_crawl"}
@@ -465,7 +484,7 @@ def deep_fallback(name: str, domain: str | None, company: str | None,
     return {"candidates": ranked[:20], "degraded": degraded}
 
 
-def _bfs_crawl(domain: str, max_pages: int = 20) -> dict[str, int]:
+def _bfs_crawl(domain: str, max_pages: int = 20, deadline=None) -> dict[str, int]:
     """BFS crawl of a domain's contact pages to harvest emails."""
     base = f"https://{domain}"
     queue = list(dict.fromkeys(
@@ -476,13 +495,16 @@ def _bfs_crawl(domain: str, max_pages: int = 20) -> dict[str, int]:
     page_count = 0
 
     while queue and page_count < max_pages:
+        if deadline is not None and deadline.expired():
+            break
         url = queue.pop(0)
         if url in visited:
             continue
         visited.add(url)
         page_count += 1
         _RATE.wait(url)
-        r = fetch(url, timeout=12.0)
+        _bfs_t = deadline.op(8.0) if deadline is not None else 12.0
+        r = fetch(url, timeout=_bfs_t)
         if not r.get("ok") or not r.get("html"):
             continue
         html = r["html"]

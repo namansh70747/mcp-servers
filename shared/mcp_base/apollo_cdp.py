@@ -1573,24 +1573,25 @@ def _guess_identifier(post_data: str) -> str:
 
 def reveal(name: str = "", company: str = "", domain: str = "",
            linkedin_url: str = "", debug: bool = False,
-           avoid_last: str | None = None) -> dict:
+           avoid_last: str | None = None, deadline=None) -> dict:
     """Reveal an email in the background by driving the live reveal-extension side panel over CDP.
 
     Returns {email, emails, extension, source, ms, credit_used, degraded, trace}. Degrades cleanly
     to a quoted reason; never raises and never fabricates. `debug=True` keeps the full step trace;
     `avoid_last` is the previous person's last name (per-window stale avoidance in parallel runs).
+    `deadline` (optional Deadline) bounds the side-panel Path B — backend Path A runs regardless.
 
     Serialized on `_CDP_LOCK`: the side-panel path mutates the shared tab + `_LAST_PANEL_PERSON`,
     so concurrent callers must not interleave.
     """
     with _CDP_LOCK:
         return _reveal_impl(name=name, company=company, domain=domain, linkedin_url=linkedin_url,
-                            debug=debug, avoid_last=avoid_last)
+                            debug=debug, avoid_last=avoid_last, _dl=deadline)
 
 
 def _reveal_impl(name: str = "", company: str = "", domain: str = "",
                  linkedin_url: str = "", debug: bool = False,
-                 avoid_last: str | None = None) -> dict:
+                 avoid_last: str | None = None, _dl=None) -> dict:
     t0 = time.monotonic()
     trace: list = []
     result: dict[str, Any] = {"email": None, "emails": [], "extension": None,
@@ -1620,8 +1621,14 @@ def _reveal_impl(name: str = "", company: str = "", domain: str = "",
             return result
         result["degraded"].extend(be.get("degraded", []))  # fall through to side panel / keyless
 
-    # FALLBACK PATH — the side-panel reveal (only works if the panel is open). Get a top-level
-    # LinkedIn page tab on THIS profile (reuse/repurpose/create + poll until navigation commits).
+    # FALLBACK PATH — the side-panel reveal (10-50s cold). Skip if the deadline doesn't allow it.
+    if _dl is not None and _dl.remaining() < 20:
+        result["degraded"].append("cdp:side-panel-skipped:deadline")
+        result["ms"] = int((time.monotonic() - t0) * 1000)
+        if not debug:
+            result.pop("trace", None)
+        return result
+
     li = _ensure_li_tab(linkedin_url)
     if li:
         # If a panel is already open it auto-updates to the new profile — skip the opener wait
