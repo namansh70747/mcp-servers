@@ -53,19 +53,39 @@ def _purpose(name: str) -> str:
         return ""
 
 
+_mod_errors: dict[str, str] = {}  # name → last import error message (for diagnostics)
+
+# Curated set exposed in lite/minimal profiles — high-utility daily-driver servers.
+LITE_SERVERS = [
+    "email-finder", "emailcheck", "whatsapp", "voice", "browser",
+    "contacts", "webscrape", "task-manager", "mailbox", "reachout",
+    "notes", "devlog", "codeindex",
+]
+
+
 def _load(name: str):
-    """Lazy-import a target server module once, cached."""
+    """Lazy-import a target server module once, error-isolated + cached.
+
+    A broken server import is recorded in _mod_errors and returns None — it never
+    propagates an exception that would crash the hub or poison the module cache.
+    """
     if name in _mod_cache:
         return _mod_cache[name]
     sp = SERVERS_DIR / name / "server.py"
     if not sp.exists():
         return None
-    spec = importlib.util.spec_from_file_location(f"hub_t_{name.replace('-', '_')}", sp)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    _mod_cache[name] = mod
-    return mod
+    try:
+        spec = importlib.util.spec_from_file_location(f"hub_t_{name.replace('-', '_')}", sp)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        _mod_cache[name] = mod
+        _mod_errors.pop(name, None)   # clear any previous error
+        return mod
+    except Exception as exc:  # noqa: BLE001
+        _mod_errors[name] = str(exc)[:200]
+        _mod_cache.pop(name, None)    # don't cache a broken module
+        return None
 
 
 @mcp.tool
@@ -175,6 +195,29 @@ async def run(server: str, tool: str, args: dict | None = None) -> dict:
             return {"server": server, "tool": tool, "result": getattr(res, "data", None)}
     except Exception as e:  # noqa: BLE001
         return err(f"{server}.{tool} failed: {e}")
+
+
+@mcp.tool
+def warm(servers: list | None = None) -> dict:
+    """Pre-load a list of servers into the hub's module cache so subsequent run() calls are instant.
+
+    Defaults to the curated LITE_SERVERS list. Pass a custom list to warm specific servers.
+    Use this at session start to eliminate cold-start latency for your daily-driver tools.
+    Returns a per-server status (loaded / error / unknown)."""
+    targets = servers if isinstance(servers, list) and servers else LITE_SERVERS
+    results: dict[str, str] = {}
+    for name in targets:
+        if name not in _server_names():
+            results[name] = "unknown"
+            continue
+        mod = _load(name)
+        if mod is not None:
+            results[name] = "loaded"
+        else:
+            results[name] = f"error: {_mod_errors.get(name, 'could not load')}"
+    return {"warmed": sum(1 for s in results.values() if s == "loaded"),
+            "errors": sum(1 for s in results.values() if s.startswith("error")),
+            "results": results}
 
 
 if __name__ == "__main__":
