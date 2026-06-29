@@ -200,6 +200,11 @@ def _build_message(to_email, subject, body, attachments=None) -> dict:
     msg["To"] = to_email
     msg["Subject"] = subject
     msg.set_content(body)
+    # E1 — spam-filter friendly headers for 1:1 personal email
+    sender_email = _profile().get("email") or ""
+    if sender_email:
+        msg["List-Unsubscribe"] = f"<mailto:{sender_email}?subject=unsubscribe>"
+        msg["Reply-To"] = sender_email
     for path in attachments or []:
         if not path:
             continue
@@ -319,7 +324,7 @@ def create_draft(to_email: str, subject: str, body: str, recipient_name: str = "
                  company: str = "", role: str = "", template_used: str = "",
                  attachments: list[str] | None = None, attach_onepager: str = "",
                  variant: str = "", sequence_id: int | None = None, step: int = 0,
-                 contact_id: int | None = None, **_ignored) -> dict:
+                 contact_id: int | None = None) -> dict:
     """Create a Gmail DRAFT (nothing sent) and log it. The safe default path — review, then send_draft.
     `attach_onepager` is a convenience path appended to attachments. Records an event + variant.
     Optional `contact_id` links this outreach to a contacts-server record (P2 cross-server identity)."""

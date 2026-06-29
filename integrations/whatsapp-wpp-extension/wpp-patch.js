@@ -61,6 +61,22 @@
           try { wa.isAuthenticated = am.isLoggedIn; st.authPatched = true; } catch (e) { st.authErr = String(e); }
         }
       }
+      // Patch CallStore.assertGet (removed in WA Web >= 2.3000.x, wa-js 4.3.1 still calls it).
+      // New CallStore: call offer is async — the call object may not be in the store yet when
+      // assertGet is called. Return a proxy so offer() can continue; wa-js sets up listeners on it.
+      if (wa.CallStore && typeof wa.CallStore.assertGet !== "function" && typeof wa.CallStore.get === "function") {
+        wa.CallStore.assertGet = function (id) {
+          var r = wa.CallStore.get(id);
+          if (r) return r;
+          // Call not in store yet — return a lightweight proxy so wa-js doesn't throw
+          return {
+            id: id, isConnected: false, peerJid: null,
+            on: function() { return this; }, off: function() { return this; },
+            once: function() { return this; }, toString: function() { return id; }
+          };
+        };
+        st.callstorePatched = true;
+      }
     } catch (e) { st.err = String((e && e.message) || e); }
     setPatch(st);
     if (W.isReady || tries > 90) clearInterval(iv);

@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import re
 
-from mcp_base import err, make_server
+from mcp_base import Jobs, err, make_server
+from mcp_base import dns_resolve, emailverify
 
 mcp = make_server(
     "emailcheck",
@@ -15,6 +16,9 @@ mcp = make_server(
                   "extract_emails (pull addresses from text), domain_report (MX+SPF+DMARC). "
                   "DNS tools need network; the rest are offline."),
 )
+JOBS = Jobs("emailcheck", max_concurrent=2, inline_wait=12.0)
+# Hard per-mailbox verify cap so one slow/blocked SMTP can never stall a bulk batch.
+PER_VERIFY_S = 8.0
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _DNS_TIMEOUT = 5.0  # seconds per query
@@ -446,46 +450,47 @@ def _resolve_txt(domain: str) -> list[str]:
 
 @mcp.tool
 def check_mx(domain: str) -> dict:
-    """Look up a domain's MX records (can it receive mail?). Needs network + dnspython."""
+    """Look up a domain's MX records with DoH fallback (Cloudflare → Google) when port 53 is
+    blocked. Never returns a false empty on DNS block — method field shows how it was resolved."""
     domain = (domain or "").strip().lower().lstrip("@")
     if "@" in domain:
         domain = _domain(domain)
     if not domain:
         return {"error": "empty domain"}
-    try:
-        import dns.resolver
-        try:
-            answers = dns.resolver.resolve(domain, "MX", lifetime=_DNS_LIFETIME)
-            mx = sorted(({"host": str(r.exchange).rstrip("."), "priority": r.preference}
-                         for r in answers), key=lambda x: x["priority"])
-            return {"domain": domain, "has_mx": True, "mx_records": mx}
-        except dns.resolver.NXDOMAIN:
-            return {"domain": domain, "has_mx": False, "error": "domain does not exist (NXDOMAIN)"}
-        except dns.resolver.NoAnswer:
-            return {"domain": domain, "has_mx": False, "error": "no MX records"}
-        except Exception as e:
-            return {"domain": domain, "has_mx": False, "error": f"{type(e).__name__}: {e}"}
-    except ImportError:
-        return {"error": "dnspython not installed"}
+    r = dns_resolve.mx(domain)
+    mx_list = [{"host": h, "priority": i} for i, h in enumerate(r.get("mx", []))]
+    return {
+        "domain": domain,
+        "has_mx": bool(mx_list),
+        "mx_records": mx_list,
+        "big_host": r.get("big_host", False),
+        "provider": r.get("provider", "other"),
+        "method": r.get("method", "none"),
+    }
 
 
 @mcp.tool
 def domain_report(domain: str) -> dict:
-    """Deliverability snapshot for a domain: MX present, SPF record, DMARC policy. Needs network."""
+    """Deliverability snapshot: MX (DoH fallback), SPF, DMARC policy, provider fingerprint.
+    All DNS lookups use DoH when port 53 is blocked — never a false-empty on restricted networks."""
     domain = (domain or "").strip().lower().lstrip("@")
     if "@" in domain:
         domain = _domain(domain)
     if not domain:
         return {"error": "empty domain"}
-    try:
-        import dns.resolver  # noqa: F401
-    except ImportError:
-        return {"error": "dnspython not installed"}
 
-    mx = check_mx(domain)
-    txt = _resolve_txt(domain)
-    spf = next((t for t in txt if t.lower().startswith("v=spf1")), None)
-    dmarc_txt = _resolve_txt(f"_dmarc.{domain}")
+    mx_info = check_mx(domain)
+    # TXT records via dns_resolve (DoH fallback) when available, else _resolve_txt
+    try:
+        txt_records = dns_resolve.txt(domain)
+    except Exception:
+        txt_records = _resolve_txt(domain)
+    spf = next((t for t in txt_records if t.lower().startswith("v=spf1")), None)
+
+    try:
+        dmarc_txt = dns_resolve.txt(f"_dmarc.{domain}")
+    except Exception:
+        dmarc_txt = _resolve_txt(f"_dmarc.{domain}")
     dmarc = next((t for t in dmarc_txt if t.lower().startswith("v=dmarc1")), None)
     policy = None
     if dmarc:
@@ -493,14 +498,157 @@ def domain_report(domain: str) -> dict:
         policy = m.group(1) if m else None
     return {
         "domain": domain,
-        "has_mx": mx.get("has_mx", False),
-        "mx_records": mx.get("mx_records", []),
+        "has_mx": mx_info.get("has_mx", False),
+        "mx_records": mx_info.get("mx_records", []),
+        "provider": mx_info.get("provider", "other"),
+        "big_host": mx_info.get("big_host", False),
+        "dns_method": mx_info.get("method", "none"),
         "spf": spf, "has_spf": bool(spf),
         "dmarc": dmarc, "dmarc_policy": policy, "has_dmarc": bool(dmarc),
-        "summary": ("Receives mail" if mx.get("has_mx") else "No MX") +
+        "summary": ("Receives mail" if mx_info.get("has_mx") else "No MX") +
                    (", SPF set" if spf else ", no SPF") +
                    (f", DMARC p={policy}" if policy else ", no DMARC"),
     }
+
+
+@mcp.tool
+def verify_deliverability(email: str, smtp: bool = True, deep: bool = False) -> dict:
+    """Full deliverability check for a single email: syntax → typo suggestion → disposable →
+    MX (DoH fallback) → SMTP probe → account-existence enumeration (works on Gmail/M365) →
+    Gravatar → verifier APIs if keys set. Returns honest tri-state deliverable + numeric score
+    + human summary. Cached 14d. Never raises. Big-host results are honest None, not a false False."""
+    return emailverify.verify(email, check_smtp=smtp, use_cache=True, deep=deep)
+
+
+@mcp.tool
+def provider_fingerprint(domain: str) -> dict:
+    """Identify a domain's exact mail provider (Google/M365/Zoho/Yahoo/gateway) by probing
+    MX + SPF include-chain + DKIM selectors + DMARC + MTA-STS + BIMI, and return a verification
+    playbook (whether SMTP is reliable, accept-all behavior, pattern prior). All DoH-backed DNS."""
+    try:
+        from mcp_base.frontier.fingerprint import fingerprint
+        return fingerprint(domain)
+    except Exception as e:  # noqa: BLE001
+        return {"domain": domain, "error": str(e)}
+
+
+def _bulk_verify_core(emails: list[str], smtp: bool = True) -> dict:
+    clean = [e.strip() for e in emails if isinstance(e, str) and e.strip()][:200]
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results: dict[str, dict] = {}
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        futs = {pool.submit(emailverify.verify, e, check_smtp=smtp): e for e in clean}
+        try:
+            for f in as_completed(futs, timeout=max(30.0, len(clean) * 1.5)):
+                e = futs[f]
+                try:
+                    results[e] = f.result(timeout=PER_VERIFY_S)
+                except Exception:
+                    results[e] = {"email": e, "deliverable": None, "confidence": "low",
+                                  "degraded": ["verify:timeout"]}
+        except Exception:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    for e in clean:
+        results.setdefault(e, {"email": e, "deliverable": None, "confidence": "low",
+                               "degraded": ["verify:timeout"]})
+    ordered = [results[e] for e in clean]
+    deliverable = sum(1 for r in ordered if r.get("deliverable") is True)
+    undeliverable = sum(1 for r in ordered if r.get("deliverable") is False)
+    return {"count": len(ordered), "deliverable": deliverable, "undeliverable": undeliverable,
+            "unknown": len(ordered) - deliverable - undeliverable, "results": ordered}
+
+
+@mcp.tool
+def bulk_verify(emails: list[str], smtp: bool = True) -> dict:
+    """Verify a batch of emails in parallel via the shared deliverability core (cache + quota aware).
+    Returns per-email results + a roll-up {deliverable/undeliverable/unknown}.
+    Small batches return inline; large batches (>25) return a {job_id} to poll with verify_status()."""
+    if not isinstance(emails, list):
+        return {"count": 0, "results": [], "error": "emails must be a list"}
+    if len([e for e in emails if isinstance(e, str) and e.strip()]) <= 25:
+        return _bulk_verify_core(emails, smtp=smtp)
+
+    def _worker(job: dict) -> None:
+        JOBS.set(job["id"], status="running", percent=5.0)
+        try:
+            out = _bulk_verify_core(emails, smtp=smtp)
+        except Exception as e:  # noqa: BLE001
+            JOBS.finish(job["id"], ok_=False, error=str(e))
+            return
+        JOBS.finish(job["id"], ok_=True, **out)
+
+    return JOBS.run_or_job("bulk_verify", _worker, count=len(emails[:200]))
+
+
+@mcp.tool
+def verify_status(job_id: str) -> dict:
+    """Poll a backgrounded bulk_verify() job by its job_id. Returns status + results when done."""
+    return JOBS.status(job_id)
+
+
+@mcp.tool
+def health() -> dict:
+    """Report server health: DNS/DoH reachability, emailverify module status, API key states."""
+    checks: dict = {}
+    degraded: list[str] = []
+    try:
+        r = dns_resolve.mx("gmail.com")
+        checks["dns"] = f"ok ({r.get('method', '?')})"
+    except Exception as e:
+        checks["dns"] = f"error: {e}"
+        degraded.append("dns: pip install dnspython or check network")
+
+    try:
+        vs = emailverify.cache_stats()
+        checks["emailverify_cache"] = vs.get("total", 0)
+    except Exception as e:
+        checks["emailverify"] = f"error: {e}"
+        degraded.append("emailverify: module error")
+
+    return {"ok": len(degraded) == 0, "checks": checks, "degraded": degraded}
+
+
+@mcp.tool
+def selftest(live: bool = False) -> dict:
+    """Preflight matrix: DNS, emailverify, check_mx, spam_score — all pass/fail.
+    live=True runs end-to-end against a known-good public address."""
+    results: dict[str, str] = {}
+    errors: list[str] = []
+
+    try:
+        r = dns_resolve.mx("gmail.com")
+        results["dns_mx"] = f"pass ({r.get('method', '?')})" if r.get("mx") else "fail: empty"
+    except Exception as e:
+        results["dns_mx"] = f"fail: {e}"
+        errors.append(str(e))
+
+    try:
+        r2 = check_mx("gmail.com")
+        results["check_mx"] = "pass" if r2.get("has_mx") else "fail: no MX"
+    except Exception as e:
+        results["check_mx"] = f"fail: {e}"
+
+    try:
+        s = spam_score("Buy now! FREE offer!!", "Click here to claim your prize.")
+        results["spam_score"] = "pass" if s.get("score", 0) > 0 else "fail: score=0"
+    except Exception as e:
+        results["spam_score"] = f"fail: {e}"
+
+    if live:
+        try:
+            v = verify_deliverability("contact@anthropic.com")
+            d = v.get("deliverable")
+            results["live_verify"] = "pass" if d is not False else f"fail: deliverable={d}"
+        except Exception as e:
+            results["live_verify"] = f"fail: {e}"
+            errors.append(str(e))
+
+    passed = sum(1 for v in results.values() if v.startswith("pass"))
+    failed = sum(1 for v in results.values() if v.startswith("fail"))
+    return {"ok": failed == 0, "pass": passed, "fail": failed, "components": results, "errors": errors}
 
 
 if __name__ == "__main__":

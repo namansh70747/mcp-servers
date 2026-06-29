@@ -508,7 +508,19 @@ def _run_engine(engine: tuple, query: str, n: int) -> list:
 
 
 def _search_all(query: str, n: int) -> list:
-    """Query all engines in parallel; merge by canonical URL, rank by cross-engine agreement then rank."""
+    """Query all engines in parallel; merge by canonical URL, rank by cross-engine agreement then rank.
+
+    Delegates to the shared mcp_base.websearch (8 engines + curl_cffi impersonation + SearXNG),
+    which returns the same {url, score, engines} shape. Falls back to this server's own engines if
+    the shared module errors or yields nothing, so behavior never regresses."""
+    try:
+        from mcp_base import websearch as _ws
+        results, _degraded = _ws.search_all(query, n=n)
+        if results:
+            return results
+    except Exception:
+        pass
+    # Fallback: this server's built-in engines
     lists: list = []
     with cf.ThreadPoolExecutor(max_workers=len(_ENGINES)) as ex:
         futs = [ex.submit(_run_engine, e, query, n * 2) for e in _ENGINES]

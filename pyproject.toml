@@ -2,7 +2,7 @@
 name = "mcp-suite"
 version = "0.1.0"
 description = "Naman's free, portable MCP server suite (one shared venv for all custom servers)."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "fastmcp>=2.0",
     "mcp-base",
@@ -56,6 +56,24 @@ embed = ["model2vec>=0.3"]
 # Optional headless browser for webscrape's render mode (JS/SPA sites). Heavy (~Chromium):
 #   uv sync --group browser && uv run playwright install chromium
 browser = ["playwright>=1.40"]
+# Optional email-pro extras for email-finder/emailcheck. ALL gracefully absent — the keyless free
+# backbone works without any of these; they raise hit-rate/reliability and light up frontier layers:
+#   curl_cffi       — Chrome TLS/HTTP2 impersonation for block-resistant search (biggest win)
+#   pypdf           — harvest emails from team/press PDFs
+#   pytesseract+cv2 — F1 OCR of emails rendered as images
+#   scikit-learn    — F3 ML email-pattern ranker (static fallback otherwise)
+#   networkx        — F8 entity-graph corroboration
+#   playwright-stealth — F9 stealth render to bypass bot-walls (needs the `browser` group too)
+#   uv sync --group email-pro     (+ uv sync --group browser for JS render)
+email-pro = [
+    "curl_cffi>=0.7",
+    "pypdf>=4.0",
+    "pytesseract>=0.3.10",
+    "opencv-python-headless>=4.9",
+    "scikit-learn>=1.4",
+    "networkx>=3.2",
+    "playwright-stealth>=1.0.6",
+]
 # Optional LOCAL speech-to-text for videoforge (transcribe / auto_captions / make_short captions).
 # faster-whisper = CTranslate2 wheels, no PyTorch; downloads a small model on first use. Free, no key.
 # Add it without disturbing other installed groups (like the codeindex `semantic` group):
@@ -78,6 +96,7 @@ voice = [
     "faster-whisper>=1.0",
     "webrtcvad>=2.0",
     "sounddevice>=0.4",
+    "audioop-lts>=0.2",
 ]
 # Optional: clone YOUR voice for the agent (Coqui XTTS + Chatterbox). Heavier.  uv sync --group voice-clone
 voice-clone = [

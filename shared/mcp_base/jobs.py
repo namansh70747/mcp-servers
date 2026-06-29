@@ -16,7 +16,9 @@ Nothing here raises into the tool; failures become an err() envelope.
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,6 +30,19 @@ from .log import get_logger
 
 # Job-record bookkeeping keys NOT surfaced as result fields when a job finishes inline.
 _META_KEYS = {"id", "kind", "status", "percent", "output", "started", "ended", "error", "cmd"}
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check whether a process is alive via os.kill(pid, 0) — works cross-restart."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True   # Process exists but we don't own it
+    except Exception:
+        return False
 
 
 def _now() -> str:
@@ -114,6 +129,63 @@ class Jobs:
         threading.Thread(target=run, daemon=True).start()
         return job
 
+    def spawn_detached(self, kind: str, cmd: list, cwd: str | None = None,
+                       env=None, output: str = "") -> dict:
+        """Launch `cmd` as a fully detached process (start_new_session=True), tracked by PID.
+
+        The subprocess survives parent MCP-server restarts.  A non-daemon reaper thread waits
+        for it and writes the terminal status; if the parent is killed before the reaper runs,
+        _reconcile() falls back to os.kill(pid, 0) liveness checks on subsequent status queries.
+        Returns the running job record immediately (does not block).
+        """
+        job = self.new_job(kind, output)
+        logf = self.dir / f"{job['id']}.log"
+
+        try:
+            lf = open(logf, "w")   # noqa: SIM115 — file kept open until reaper closes it
+            try:
+                proc = subprocess.Popen(
+                    cmd, cwd=cwd, env=env,
+                    stdout=lf, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,   # detach — survives parent death
+                )
+            except Exception:
+                lf.close()
+                raise
+        except Exception as e:  # noqa: BLE001
+            self.finish(job["id"], ok_=False, error=f"launch failed: {e}")
+            return self.load(job["id"]) or job
+
+        # Persist PID + log path immediately so post-restart status() can check liveness
+        self.set(job["id"], status="running", pid=proc.pid, log=str(logf))
+        self.track_proc(job["id"], proc)
+
+        def _reaper():
+            try:
+                rc = proc.wait()
+            except Exception:  # noqa: BLE001
+                rc = -1
+            try:
+                lf.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.untrack_proc(job["id"])
+            cur = self.load(job["id"]) or {}
+            if cur.get("status") not in ("cancelled", "done", "error"):
+                if rc == 0:
+                    try:
+                        tail = Path(logf).read_text().strip()[-3000:]
+                    except Exception:  # noqa: BLE001
+                        tail = ""
+                    self.finish(job["id"], ok_=True, summary=tail, log=str(logf))
+                else:
+                    self.finish(job["id"], ok_=False,
+                                error=f"agent exited {rc}", log=str(logf))
+
+        threading.Thread(target=_reaper, daemon=False).start()
+        return self.load(job["id"]) or job
+
     def run_or_job(self, kind: str, worker, inline_wait: float | None = None, output: str = "",
                    **meta) -> dict:
         """spawn() + await_inline(): short tasks return their result; long ones return a job_id."""
@@ -160,11 +232,19 @@ class Jobs:
     # ----------------------------------------------------------------- read API (wire to @mcp.tool)
     def _reconcile(self, job: dict) -> dict:
         if job.get("status") in ("running", "queued"):
-            with self._lock:
-                alive = job["id"] in self._active
-            if not alive:
-                return {**job, "status": "interrupted",
-                        "error": "worker not running (process restarted while this job was active)"}
+            pid = job.get("pid")
+            if pid is not None:
+                # PID-based liveness — works after parent MCP-server restarts
+                if not _pid_alive(int(pid)):
+                    return {**job, "status": "interrupted",
+                            "error": "worker process not running (may have crashed or been killed)"}
+            else:
+                # Legacy thread-based check (non-detached spawns)
+                with self._lock:
+                    alive = job["id"] in self._active
+                if not alive:
+                    return {**job, "status": "interrupted",
+                            "error": "worker not running (process restarted while this job was active)"}
         return job
 
     def load(self, jid: str) -> dict | None:
@@ -218,6 +298,14 @@ class Jobs:
                     proc.wait(timeout=5)
                 except Exception:  # noqa: BLE001
                     proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        elif j.get("pid"):
+            # Post-restart: proc handle gone, kill by PID
+            import signal
+            pid = int(j["pid"])
+            try:
+                os.kill(pid, signal.SIGTERM)
             except Exception:  # noqa: BLE001
                 pass
         return ok(**self.set(jid, status="cancelled", ended=_now()))

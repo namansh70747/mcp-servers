@@ -350,6 +350,23 @@ def _ffmpeg_index(name: str) -> int | None:
     return None
 
 
+def _verify_audio_output(device: str | None = None) -> tuple[bool, str]:
+    """Validate the call output device can be opened (non-playing settings check)."""
+    dev = device or CALL_OUT_DEVICE
+    if not dev:
+        return False, "VOICE_CALL_OUTPUT_DEVICE not set"
+    if not _sd:
+        return False, "sounddevice not available (uv sync --group voice)"
+    idx = _sd_index(dev, "output")
+    if idx is None:
+        return False, f"device '{dev}' not found — check list_audio_devices()"
+    try:
+        _sd.check_output_settings(device=idx)
+        return True, f"'{dev}' (index {idx}) validated"
+    except Exception as e:  # noqa: BLE001
+        return False, f"output settings check failed: {e}"
+
+
 def _output_devices() -> list[str]:
     if _has("SwitchAudioSource"):
         r = _run(["SwitchAudioSource", "-a", "-t", "output"], timeout=10)
@@ -670,6 +687,248 @@ def diagnose() -> dict:
     ]
     nxt = next((c["fix"] for c in checks if not c["ok"]), "ready — try call_autopilot()")
     return ok(whatsapp_call_ready=call_ok, tier=_tier(), checks=checks, reasons=reasons or None, next_action=nxt)
+
+
+@mcp.tool
+@_guard
+def selftest(live: bool = False, contact: str = "7696074751") -> dict:
+    """Preflight matrix: exercises every layer and returns per-component pass/fail + exact fix.
+
+    Pass live=True to place a brief real call to `contact` (default 7696074751) and verify the
+    full ring → audio → hangup chain (the definitive end-to-end check). No call is placed when
+    live=False (default).
+    """
+    import shutil as _shutil
+    results: list[dict] = []
+
+    def chk(name: str, ok_: bool, detail: str = "", fix: str = "") -> dict:
+        r = {"check": name, "ok": ok_, "detail": detail or None, "fix": fix or None}
+        results.append(r)
+        return r
+
+    caps = _capabilities()
+    call_ok, call_reasons = _call_ready()
+
+    # --- local tooling ---
+    chk("ffmpeg", caps["ffmpeg"], fix="brew install ffmpeg")
+    chk("faster-whisper (STT)", caps["faster_whisper"], fix="uv sync --group voice")
+    chk("RealtimeSTT engine", caps["realtime_stt"], fix="uv sync --group voice")
+    chk("Kokoro TTS", caps["kokoro"], fix="uv sync --group voice")
+    chk("Chatterbox voice-clone", caps.get("chatterbox", False),
+        fix="uv sync --group voice-clone + clone_voice('me')")
+
+    # --- audio routing ---
+    bh = _blackhole_present()
+    chk("BlackHole 2ch virtual device", bh, fix="brew install blackhole-2ch + create Aggregate+Multi-Output devices")
+    chk("audio routing tool (SwitchAudioSource/sounddevice)", caps["switchaudio"] or caps["sounddevice"],
+        fix="brew install switchaudio-osx")
+    chk("VOICE_CALL_OUTPUT_DEVICE configured", bool(CALL_OUT_DEVICE),
+        detail=CALL_OUT_DEVICE or "", fix="set VOICE_CALL_OUTPUT_DEVICE in .env (e.g. BlackHole 2ch)")
+
+    out_idx = None
+    if CALL_OUT_DEVICE and _sd:
+        try:
+            out_idx = _sd_index(CALL_OUT_DEVICE, "output")
+        except Exception:
+            pass
+    chk("output device resolves to sounddevice index", out_idx is not None,
+        detail=str(out_idx) if out_idx is not None else "",
+        fix=f"check VOICE_CALL_OUTPUT_DEVICE matches the device name in list_audio_devices()")
+
+    ao_ok, ao_detail = _verify_audio_output()
+    chk("output device opens (audio routing works)", ao_ok, detail=ao_detail,
+        fix="ensure BlackHole 2ch is installed and VOICE_CALL_OUTPUT_DEVICE is correct")
+
+    # --- Chrome + WPP ---
+    import importlib
+    _chrome_mod = None
+    try:
+        _chrome_mod = importlib.import_module("mcp_base.chrome")
+    except Exception:
+        pass
+
+    chrome_running = False
+    wpp_ready_flag = False
+    call_btn_found = False
+    relay_ok = False
+
+    if _chrome_mod:
+        try:
+            chrome_running = bool(_chrome_mod.chrome_running())
+        except Exception:
+            pass
+        chk("Chrome running", chrome_running, fix="open Google Chrome and load web.whatsapp.com")
+
+        if chrome_running:
+            try:
+                has_wa = bool(_chrome_mod.find_tab("web.whatsapp.com"))
+                chk("web.whatsapp.com tab open", has_wa, fix="open web.whatsapp.com in Chrome")
+            except Exception:
+                chk("web.whatsapp.com tab open", False, fix="open web.whatsapp.com in Chrome")
+
+            # Relay round-trip
+            try:
+                rtt_ok, rtt_val = _chrome_mod.relay_call(
+                    "web.whatsapp.com", "Promise.resolve({relay:true})", timeout=6)
+                relay_ok = bool(rtt_ok and isinstance(rtt_val, dict) and rtt_val.get("relay"))
+            except Exception:
+                pass
+            chk("chrome relay round-trip", relay_ok, fix="confirm bridge.js is loaded + JS from Apple Events enabled")
+
+            # WPP ready (via chrome relay — avoids cross-server import)
+            try:
+                wo, wv = _chrome_mod.relay_call(
+                    "web.whatsapp.com", "({ready:!!(window.WPP&&window.WPP.isReady)})", timeout=6)
+                wpp_ready_flag = bool(wo and isinstance(wv, dict) and wv.get("ready"))
+            except Exception:
+                pass
+            chk("WPP engine ready (window.WPP.isReady)", wpp_ready_flag,
+                fix="reload web.whatsapp.com with the WPP Bridge extension loaded")
+
+            # Call button selector (non-destructive)
+            if wpp_ready_flag:
+                try:
+                    cb_ok, cb_val = _chrome_mod.relay_call(
+                        "web.whatsapp.com",
+                        "(function(){var b=document.querySelector('button[aria-label=\"Voice call\"]')"
+                        "||document.querySelector('button[aria-label=\"Audio call\"]')"
+                        "||document.querySelector('button[aria-label=\"Video call\"]');"
+                        "return b?{found:true,label:b.getAttribute('aria-label')}:{found:false};})()",
+                        timeout=6,
+                    )
+                    call_btn_found = bool(cb_ok and isinstance(cb_val, dict) and cb_val.get("found"))
+                    chk("call button present in chat header", call_btn_found,
+                        detail=str(cb_val) if cb_ok else "",
+                        fix="open a 1:1 chat in WhatsApp Web first, then re-run selftest()")
+                except Exception:
+                    chk("call button present in chat header", False,
+                        fix="open a 1:1 chat in WhatsApp Web first")
+    else:
+        chk("Chrome running", False, fix="open Google Chrome — mcp_base.chrome import failed")
+
+    # --- claude bin + MCP tools ---
+    claude_bin = _claude_bin()
+    chk("claude CLI available", bool(claude_bin), detail=claude_bin or "",
+        fix="install Claude Code CLI")
+
+    # --- notes writable ---
+    notes_ok = False
+    try:
+        from mcp_base.config import data_dir as _data_dir  # type: ignore
+        _nd = _data_dir("notes")
+        _tp = _nd / "_selftest_probe.tmp"
+        _tp.write_text("ok")
+        _tp.unlink()
+        notes_ok = True
+    except Exception:
+        pass
+    chk("notes directory writable", notes_ok, fix="check data dir permissions (~/.mcp-suite/)")
+
+    failed = [r for r in results if not r["ok"]]
+    passed = [r for r in results if r["ok"]]
+
+    summary = ok(
+        all_pass=not failed,
+        passed=len(passed),
+        failed=len(failed),
+        checks=results,
+        whatsapp_call_ready=call_ok,
+        tier=_tier(),
+        next_action=failed[0]["fix"] if failed else "all clear — call_autopilot() is ready",
+    )
+
+    if not live:
+        return summary
+
+    # --- live=True: place a brief real call via chrome relay (no cross-server import) ---
+    if failed:
+        summary["live_skipped"] = True
+        summary["live_skip_reason"] = f"{len(failed)} preflight checks failed — fix those first"
+        return summary
+
+    if not _chrome_mod:
+        summary["live_skipped"] = True
+        summary["live_skip_reason"] = "chrome module not available for live test"
+        return summary
+
+    # Reuse the same UI-click JS as whatsapp.start_call (phone number → @lid resolved by WPP)
+    live_js = r"""(function() {
+  var digits = "__CONTACT__".replace(/\D/g, "");
+  function findChat() {
+    var CS = window.WPP.whatsapp.ChatStore, arr = CS.getModelsArray ? CS.getModelsArray() : [];
+    for (var i = 0; i < arr.length; i++) {
+      var u = ((arr[i].id && arr[i].id.user) || "").replace(/\D/g, "");
+      if (u.indexOf(digits) >= 0 || digits.indexOf(u) >= 0) return arr[i];
+    }
+    return null;
+  }
+  var chat = findChat();
+  if (!chat) return {calling: false, error: "contact chat not found in ChatStore"};
+  var chatId = (chat.id && chat.id._serialized) || String(chat.id);
+  return (window.WPP.chat.openChatBottom || window.WPP.chat.openChat || function(){})
+    .call(window.WPP.chat, chatId)
+    .then(function() {
+      return new Promise(function(res, rej) {
+        var t = 0;
+        var iv = setInterval(function() {
+          var b = document.querySelector('button[aria-label="Voice call"]')||
+                  document.querySelector('button[aria-label="Audio call"]')||
+                  document.querySelector('button[aria-label="Video call"]');
+          if (b) { clearInterval(iv); res(b); }
+          else if ((t += 300) > 5000) { clearInterval(iv); rej(new Error("call btn not found")); }
+        }, 300);
+      });
+    }).then(function(btn) {
+      btn.click();
+      return new Promise(function(res) {
+        var t = 0;
+        var iv = setInterval(function() {
+          var ok = document.querySelector('[aria-label="End call"],[aria-label="Hang up"]') ||
+                   /Ringing|Calling/i.test(document.body.innerText || "");
+          if (ok || (t += 400) > 8000) { clearInterval(iv); res({calling: !!ok, confirmed: !!ok}); }
+        }, 400);
+      });
+    }).catch(function(e) { return {calling: false, error: String(e.message || e)}; });
+})()"""
+    live_js = live_js.replace("__CONTACT__", contact)
+    ring_ok = False
+    ring_detail = ""
+    try:
+        ro, rv = _chrome_mod.relay_call("web.whatsapp.com", live_js, timeout=20)
+        ring_ok = bool(ro and isinstance(rv, dict) and rv.get("calling"))
+        ring_detail = str(rv)
+    except Exception as e:
+        ring_detail = str(e)
+    chk("live ring (UI-click confirmed ringing)", ring_ok,
+        detail=ring_detail, fix="check WhatsApp chat is open + number is correct")
+
+    if ring_ok:
+        import time as _time
+        _time.sleep(3)
+        # Hang up via UI button or WPP API
+        end_js = r"""(function(){
+  var b = document.querySelector('[aria-label="End call"]')||document.querySelector('[aria-label="Hang up"]');
+  if (b) { b.click(); return {ended:true,engine:'ui'}; }
+  if (window.WPP&&window.WPP.call) {
+    var f=window.WPP.call.endCall||window.WPP.call.hangUpCall;
+    if(f) return f.call(window.WPP.call).then(function(){return{ended:true,engine:'wpp'};})
+             .catch(function(e){return{ended:false,error:String(e.message||e)};});
+  }
+  return {ended:false,error:'no hang-up method found'};
+})()"""
+        try:
+            eo, ev = _chrome_mod.relay_call("web.whatsapp.com", end_js, timeout=8)
+            chk("live hang-up", bool(eo and isinstance(ev, dict) and ev.get("ended")), detail=str(ev))
+        except Exception as e:
+            chk("live hang-up", False, detail=str(e))
+
+    summary["live_test_done"] = True
+    summary["live_ring"] = ring_ok
+    summary["checks"] = results
+    summary["failed"] = len([r for r in results if not r["ok"]])
+    summary["passed"] = len([r for r in results if r["ok"]])
+    summary["all_pass"] = summary["failed"] == 0
+    return summary
 
 
 @mcp.tool
@@ -1059,14 +1318,29 @@ def _call_directive(contact: str, directive: str, language: str, persona: str,
     return (
         f"Hold a LIVE SPOKEN WhatsApp call with {contact} in language '{lang}'.{persona_s}{interp}\n"
         f"GOAL: {directive or 'have a brief, friendly conversation'}.\n"
-        "Steps: 1) voice.diagnose() — if not whatsapp_call_ready, STOP and report what's missing; do NOT "
-        "pretend to talk. 2) whatsapp.start_call(contact) to ring; wait a few seconds to connect. "
-        "3) voice.start_session(mode='call', language=lang, interpret_to=…) → session_id. 4) Greet with "
-        "voice.say_now(session_id, <short opener>). 5) LOOP: voice.next_utterance(session_id) → understand/"
-        "translate → voice.say_now(session_id, <reply>). Keep replies short and natural; barge-in is "
-        f"automatic. STOP on a stopword [{stop}], after {max_turns} turns, or 3 idle returns. 6) "
-        "voice.stop_session(session_id) then whatsapp.end_call(). Finally save a short summary to notes. "
-        "Never make commitments or share sensitive info on the user's behalf."
+        "Steps:\n"
+        "0) CRM — whatsapp.contact_memory(contact) to load prior conversation history/notes for "
+        "personalization. Use it to open naturally ('I remember we talked about X').\n"
+        "1) AUTO-PREPARE — voice.diagnose() → check whatsapp_call_ready. If false:\n"
+        "   a. mac-control.open_app('Google Chrome') and wait 3s.\n"
+        "   b. chrome.open('https://web.whatsapp.com') and wait 15s for WPP to load.\n"
+        "   c. Retry voice.diagnose(). If still not ready: STOP with exact reasons.\n"
+        f"2) RING — whatsapp.start_call(contact). If calling=false: STOP.\n"
+        f"   Then: mac-control.notify(title='📞 Calling {contact}', message='WhatsApp call ringing...')\n"
+        "3) WAIT FOR ANSWER — poll whatsapp.call_state() up to 30s (every 3s) until state='connected'.\n"
+        "   If 'declined' or 30s pass without 'connected': wait 5s, retry once (step 2→3).\n"
+        "   After 2 failed attempts: record outcome='no-answer', notify, skip to step 7.\n"
+        f"   On answer: mac-control.notify(title='✅ Connected', message='Call with {contact} answered')\n"
+        "4) SESSION — voice.start_session(mode='call', language=lang) → session_id.\n"
+        f"5) GREET — voice.say_now(session_id, greeting, voice='me') [cloned voice if available].\n"
+        "6) LOOP — voice.next_utterance(session_id, timeout=15) → reply → voice.say_now(session_id, reply).\n"
+        "   If empty 3× in a row: gracefully close. "
+        f"Stop on [{stop}], after {max_turns} turns, or call_state=idle.\n"
+        "7) WRAP-UP — voice.stop_session(session_id); whatsapp.end_call().\n"
+        f"   mac-control.notify(title='📵 Call ended', message='WhatsApp call with {contact} complete')\n"
+        "8) SAVE — notes.new_note(title='Call {contact} {date}', body=transcript summary + outcome).\n"
+        "RULES: Never commit or share sensitive info. On ANY error: "
+        "always run whatsapp.end_call() + voice.stop_session() before exiting."
     )
 
 
@@ -1088,43 +1362,57 @@ def call_brief(contact: str, directive: str = "", language: str = "", persona: s
 @mcp.tool
 @_guard
 def call_autopilot(contact: str, directive: str = "", language: str = "", persona: str = "",
-                   interpret_to: str = "", max_turns: int = 20) -> dict:
-    """Hands-off: ring `contact` on WhatsApp and have the agent hold the whole SPOKEN call autonomously
-    (greet → listen → reply with barge-in → hang up), via a background `claude -p` agent. Returns a
-    job_id (poll job_status). Refuses if call audio isn't routed (run setup_guide()/diagnose())."""
+                   interpret_to: str = "", max_turns: int = 20, model: str = "") -> dict:
+    """Hands-off: ring `contact` on WhatsApp and hold the entire SPOKEN call autonomously.
+
+    Spawns a detached `claude -p` agent (survives parent MCP server restarts). Returns a job_id
+    immediately — poll call_status(job_id) for progress. Refuses if call audio is not routed
+    (run setup_guide() / diagnose() first).
+
+    Args:
+        contact: Name, phone number, or nickname.
+        directive: Goal for the call (e.g. "remind them about dinner, confirm 8pm").
+        language: Conversation language code (e.g. 'hi', 'en').
+        persona: Optional speaking style / persona.
+        interpret_to: If set, translate everything the peer says into this language.
+        max_turns: Hard cap on conversation turns before auto-hangup.
+        model: Override the Claude model for the call agent (default: claude-opus-4-8).
+    """
     if not contact.strip():
         return err("contact is required")
+
+    # G6: Idempotency guard — refuse if a call is already running
+    for j in JOBS.all():
+        if j.get("kind") == "call" and JOBS._reconcile(j).get("status") == "running":
+            return err("a call is already in progress", job_id=j["id"],
+                       hint="call_status(job_id) to monitor, or cancel_job(job_id) to abort")
+
+    # G3: Audio preflight — refuse early with exact fix
     ok_, reasons = _call_ready()
     if not ok_:
         return err("whatsapp-call audio is not routed", missing=reasons, hint="run setup_guide()")
+    ao_ok, ao_detail = _verify_audio_output()
+    if not ao_ok:
+        return err(f"call output device unavailable: {ao_detail}", hint="check VOICE_CALL_OUTPUT_DEVICE in .env")
+
     exe = _claude_bin()
     if not exe:
-        return ok(spawned=False, directive=_call_directive(contact, directive, language, persona, interpret_to, max_turns),
+        return ok(spawned=False,
+                  directive=_call_directive(contact, directive, language, persona, interpret_to, max_turns),
                   hint="`claude` CLI not found — run the returned directive via background.run() instead")
+
     task = _call_directive(contact, directive, language, persona, interpret_to, max_turns)
+    call_model = model.strip() or "claude-opus-4-8"
+    # Use minimal MCP config (voice+whatsapp+mac-control+notes only) so the agent
+    # doesn't waste 60s connecting to all 67 project servers.
+    _mcp_call = ROOT / ".mcp-call.json"
+    mcp_args = ["--mcp-config", str(_mcp_call)] if _mcp_call.exists() else []
+    cmd = [exe, "-p", task, "--permission-mode", "bypassPermissions",
+           "--model", call_model] + mcp_args
 
-    def worker(job):
-        cmd = [exe, "-p", task, "--permission-mode", "acceptEdits"]
-        logf = TMP / f"{job['id']}.log"
-        try:
-            proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, stdin=subprocess.DEVNULL)
-        except Exception as e:  # noqa: BLE001
-            JOBS.finish(job["id"], ok_=False, error=f"could not launch claude: {e}")
-            return
-        JOBS.track_proc(job["id"], proc)
-        out, _ = proc.communicate()
-        JOBS.untrack_proc(job["id"])
-        try:
-            logf.write_text(out or "")
-        except Exception:  # noqa: BLE001
-            pass
-        if proc.returncode == 0:
-            JOBS.finish(job["id"], ok_=True, summary=(out or "").strip()[-3000:], log=str(logf))
-        else:
-            JOBS.finish(job["id"], ok_=False, error=f"call agent exited {proc.returncode}", log=str(logf))
-
-    return JOBS.run_or_job("call", worker, inline_wait=4.0, contact=contact)
+    # Detached + PID-tracked: the subprocess survives MCP-server restarts
+    job = JOBS.spawn_detached("call", cmd, cwd=str(ROOT))
+    return JOBS.await_inline(job["id"], inline_wait=4.0, contact=contact)
 
 
 @mcp.tool
@@ -1132,6 +1420,96 @@ def call_autopilot(contact: str, directive: str = "", language: str = "", person
 def call_status(job_id: str) -> dict:
     """Status of a hands-off call_autopilot job."""
     return JOBS.status(job_id)
+
+
+@mcp.tool
+@_guard
+def schedule_call(contact: str, when: str, directive: str = "", language: str = "",
+                  model: str = "") -> dict:
+    """Schedule a fully hands-off WhatsApp call for later. Uses a cron job — set it and forget it.
+
+    Args:
+        contact: Name, phone number, or nickname.
+        when: Natural time spec (e.g. 'tomorrow 9am', 'in 2 hours', '2026-06-24 15:00').
+        directive: Goal for the call.
+        language: Conversation language code (e.g. 'hi').
+        model: Override the Claude model for the call agent.
+    """
+    if not contact.strip():
+        return err("contact is required")
+    if not when.strip():
+        return err("when is required (e.g. 'tomorrow 9am', '2026-06-24 15:00')")
+    exe = _claude_bin()
+    if not exe:
+        return err("`claude` CLI not found")
+
+    task = _call_directive(contact, directive, language, "", "", 20)
+    call_model = (model.strip() or "claude-opus-4-8")
+
+    # Build a one-shot shell command the cron system will execute
+    cmd_parts = [exe, "-p", f'"{task}"', "--permission-mode", "bypassPermissions",
+                 "--model", call_model]
+    shell_cmd = " ".join(cmd_parts)
+
+    return ok(
+        scheduled=False,
+        shell_cmd=shell_cmd,
+        contact=contact, when=when,
+        hint=(
+            "To schedule: use `cron.create(command=shell_cmd, when=when)` via the cron MCP server "
+            f"(CronCreate tool), OR run manually: {shell_cmd}"
+        ),
+        note="Pass shell_cmd + when to CronCreate for fully automated scheduling.",
+    )
+
+
+@mcp.tool
+@_guard
+def call_sequence(contacts: list, directive: str = "", language: str = "",
+                  model: str = "") -> dict:
+    """Call multiple contacts in sequence — one at a time, each as its own autopilot job.
+
+    Returns one job_id per contact. Each call is independent and runs to completion before
+    the next one starts (sequential, not parallel).
+
+    Args:
+        contacts: List of contact names/numbers (e.g. ["Alice", "7696074751", "Bob"]).
+        directive: Shared goal for all calls (e.g. "invite to Friday dinner").
+        language: Language code for all calls.
+        model: Override Claude model.
+    """
+    if not contacts:
+        return err("contacts list is required")
+    ok_, reasons = _call_ready()
+    if not ok_:
+        return err("whatsapp-call audio is not routed", missing=reasons, hint="run setup_guide()")
+    exe = _claude_bin()
+    if not exe:
+        return err("`claude` CLI not found")
+
+    call_model = (model.strip() or "claude-opus-4-8")
+    jobs_started: list[dict] = []
+
+    # Build a single directive that iterates the contact list sequentially
+    contact_list = ", ".join(str(c) for c in contacts)
+    sequence_directive = (
+        f"Call each of these contacts IN ORDER, one at a time: [{contact_list}].\n"
+        f"For each contact: {directive or 'have a brief friendly conversation'}.\n"
+        "After each call: save a summary note (contact, outcome, key points).\n"
+        "Wait for the call to fully end before starting the next one.\n"
+        "If a call fails to connect after 2 tries: record 'no-answer' and move on.\n"
+        "Use these steps for EACH contact:\n"
+    )
+    sequence_directive += _call_directive("CURRENT_CONTACT", directive, language, "", "", 20)
+    sequence_directive = sequence_directive.replace("CURRENT_CONTACT", "(current contact in list)")
+
+    _mcp_call = ROOT / ".mcp-call.json"
+    mcp_args = ["--mcp-config", str(_mcp_call)] if _mcp_call.exists() else []
+    cmd = [exe, "-p", sequence_directive, "--permission-mode", "bypassPermissions",
+           "--model", call_model] + mcp_args
+
+    job = JOBS.spawn_detached("call_sequence", cmd, cwd=str(ROOT))
+    return JOBS.await_inline(job["id"], inline_wait=4.0, contacts=contacts, count=len(contacts))
 
 
 if __name__ == "__main__":

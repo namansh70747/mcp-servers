@@ -19,6 +19,7 @@ import difflib
 import json
 import mimetypes
 import re
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -1017,29 +1018,272 @@ def post_text_status(text: str) -> dict:
 
 @mcp.tool
 def start_call(contact: str, video: bool = False, exact: bool = False) -> dict:
-    """Place a WhatsApp voice/video call (you talk). Best-effort — web calling may be unavailable."""
+    """Place a WhatsApp voice/video call by clicking the real UI button (works on WA Web >= 2.3000).
+
+    Drives the actual WhatsApp DOM instead of the broken WPP.call.offer() API. Opens the chat,
+    clicks the call button (handling split-button voice/video menus), and confirms the ringing
+    overlay appeared before returning.
+    """
     if (e := _need_ready()):
         return e
     c, resp = _resolve(contact, exact)
     if resp and not c:
         return resp
-    expr = ("(function(){if(!(window.WPP&&window.WPP.call&&window.WPP.call.offerCall))"
-            "throw new Error('calls not supported by this wa-js/WhatsApp build');"
-            f"return window.WPP.call.offerCall({{chatId:{j(c['id'])},isVideo:{str(bool(video)).lower()}}})"
-            ".then(function(){return {calling:true};});})()")
-    return _act("call", lambda: wpp_raw(expr), contact_name=c.get("name", ""), contact_id=c["id"])
+
+    # Build the JS with simple string replacement — avoids {{ escaping hell in f-strings.
+    _JS = r"""(function() {
+  var chatId = __CHAT_ID__;
+  var isVideo = __IS_VIDEO__;
+
+  function waitFor(check, maxMs, step) {
+    step = step || 300;
+    return new Promise(function(res, rej) {
+      var r = check(); if (r) { res(r); return; }
+      var elapsed = 0;
+      var iv = setInterval(function() {
+        elapsed += step;
+        var r = check();
+        if (r) { clearInterval(iv); res(r); }
+        else if (elapsed >= maxMs) { clearInterval(iv); rej(new Error('timeout')); }
+      }, step);
+    });
+  }
+
+  function findCallUI() {
+    if (document.querySelector('[aria-label="End call"],[aria-label="Hang up"]')) return 'end-btn';
+    if (/Ringing|Calling/i.test(document.body.innerText || '')) return 'ringing-text';
+    return null;
+  }
+
+  // Primary: WPP.call.offer — works in the relay context (MAIN world), bypasses self-chat UI restriction
+  function tryWPPOffer() {
+    return new Promise(function(res, rej) {
+      if (!window.WPP || !window.WPP.call || typeof window.WPP.call.offer !== 'function') {
+        return rej(new Error('WPP.call.offer not available'));
+      }
+      try {
+        var p = window.WPP.call.offer(chatId, {isVideo: isVideo});
+        if (p && typeof p.then === 'function') {
+          p.then(function(r) { res({wpp: true, callId: r && r.id}); })
+           .catch(function(e) { rej(e); });
+        } else {
+          res({wpp: true, sync: true});
+        }
+      } catch(e) { rej(e); }
+    });
+  }
+
+  // Fallback: open the chat and click the header call button
+  function openChat() {
+    var rows = Array.from(document.querySelectorAll('[data-testid="cell-frame-container"]'));
+    var numStr = chatId.split('@')[0].replace(/\D/g,'').slice(-10);
+    for (var i = 0; i < rows.length; i++) {
+      var txt = rows[i].innerText || '';
+      if (txt.indexOf(numStr) > -1) { rows[i].click(); return Promise.resolve('row-click'); }
+    }
+    try {
+      if (window.WPP && window.WPP.chat) {
+        var fn = window.WPP.chat.openChatBottom || window.WPP.chat.openChat;
+        if (fn) { try { fn.call(window.WPP.chat, chatId); } catch(e) {} }
+      }
+    } catch(e) {}
+    return Promise.resolve('wpp-fired');
+  }
+
+  function findCallBtn() {
+    return (document.querySelector('button[aria-label="Voice call"]') ||
+            document.querySelector('button[aria-label="Audio call"]') ||
+            document.querySelector('button[aria-label="Video call"]'));
+  }
+
+  function findCaretEl(btn) {
+    var svgs = btn.querySelectorAll('svg');
+    for (var i = 0; i < svgs.length; i++) {
+      var t = svgs[i].querySelector('title');
+      if (t && /arrow|caret|drop/i.test(t.textContent)) {
+        return svgs[i].parentElement || svgs[i];
+      }
+    }
+    return null;
+  }
+
+  function dismissDialog() {
+    var dlg = document.querySelector('[data-testid="dropdown"],[role="listbox"],[role="dialog"]');
+    if (dlg) document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true,cancelable:true}));
+  }
+
+  function doUIClick() {
+    return openChat().then(function() {
+      return waitFor(findCallBtn, 6000, 300);
+    }).then(function(btn) {
+      var lbl = (btn.getAttribute('aria-label') || '').toLowerCase();
+      var isVideoBtn = lbl.indexOf('voice') < 0 && lbl.indexOf('audio') < 0;
+      if (!isVideo && isVideoBtn) {
+        var caret = findCaretEl(btn);
+        if (caret) {
+          caret.dispatchEvent(new MouseEvent('click', {bubbles:true,cancelable:true}));
+          return waitFor(function() {
+            var direct = (document.querySelector('[aria-label="Voice call"]') ||
+                          document.querySelector('[aria-label="Audio call"]'));
+            if (direct) return direct;
+            return Array.from(document.querySelectorAll('li,div[role="menuitem"]')).find(function(el) {
+              return /voice\s*call|audio\s*call/i.test(el.textContent);
+            }) || null;
+          }, 1500, 200).then(function(item) {
+            item.click();
+          }).catch(function() {
+            dismissDialog();
+            var btn2 = findCallBtn(); if (btn2) btn2.click();
+          });
+        } else {
+          btn.click();
+        }
+      } else {
+        btn.click();
+      }
+    });
+  }
+
+  // Try WPP direct call first; fall back to UI click on failure
+  return tryWPPOffer()
+    .catch(function() { return doUIClick(); })
+    .then(function() {
+      return waitFor(findCallUI, 10000, 400).then(function(how) {
+        return {calling: true, engine: 'wpp+ui', confirmed: how};
+      }).catch(function() {
+        return {calling: true, engine: 'wpp+ui', confirmed: false};
+      });
+    })
+    .catch(function(e) {
+      return {calling: false, error: String((e && e.message) || e)};
+    });
+})()"""
+
+    expr = _JS.replace("__CHAT_ID__", j(c["id"])).replace("__IS_VIDEO__", str(bool(video)).lower())
+
+    def _do_call():
+        ok_r, val = wpp_raw(expr, timeout=20)
+        if not ok_r:
+            return False, val
+        if isinstance(val, dict):
+            if val.get("calling"):
+                return True, val
+            return False, val.get("error", str(val))
+        return False, f"unexpected relay response: {val!r}"
+
+    return _act("call", _do_call, contact_name=c.get("name", ""), contact_id=c["id"])
+
+
+@mcp.tool
+def call_state() -> dict:
+    """Read the current WhatsApp call state from the live DOM + CallStore.
+
+    Returns state: 'idle' | 'ringing_out' | 'ringing_in' | 'connected' | 'unknown'
+    and details: isConnected, isRinging, peerNumber, callId.
+    Use after start_call() to confirm the peer answered before speaking.
+    """
+    if (e := _need_ready()):
+        return e
+    expr = r"""(function() {
+  var W = window.WPP;
+  if (!W) return {state: 'unknown', error: 'WPP unavailable'};
+
+  // DOM element-based detection — never use text scanning (body text contains bundled JS
+  // and chat history with call-related words that cause false positives)
+  var hasEndBtn = !!(document.querySelector(
+    '[aria-label="End call"],[aria-label="Hang up"],[data-icon="call-end"],[data-icon="call-decline"]'
+  ));
+  var hasCallScreen = !!(document.querySelector(
+    '[data-testid="call-screen"],[data-testid="calling-screen"],[data-testid="in-call-screen"],' +
+    '[data-testid="call-container"],[data-testid="voip-call-screen"],[data-testid="call-overlay"]'
+  ));
+  var hasRingingUI = !!(document.querySelector(
+    '[data-testid="outgoing-call"],[data-testid="calling-animation"]'
+  ));
+  // Check visible ringing text ONLY inside known call overlay elements (not message list)
+  var callOverlay = document.querySelector('[data-testid="call-screen"],[data-testid="calling-screen"],[data-testid="call-overlay"]');
+  var overlayText = callOverlay ? (callOverlay.innerText || '') : '';
+  var hasRingingText = /Ringing|Calling/i.test(overlayText);
+
+  // CallStore-based (most reliable for active calls)
+  var csState = {state: 'idle', calls: 0};
+  try {
+    var CS = W.whatsapp && W.whatsapp.CallStore;
+    if (CS) {
+      var arr = CS.getModelsArray ? CS.getModelsArray() : [];
+      csState.calls = arr.length;
+      if (arr.length > 0) {
+        var c = arr[arr.length - 1];
+        csState.callId = c.id || '';
+        var peerJid = (c.peerJid && c.peerJid._serialized) || String(c.peerJid || '');
+        csState.peerJid = peerJid;
+        csState.peerNumber = peerJid.split('@')[0].replace(/\D/g,'');
+        csState.isConnected = !!c.isConnected;
+        csState.isRinging   = !!c.isRinging;
+        csState.isOutgoing  = !!c.isOutgoing;
+        csState.isIncoming  = !!c.isIncoming;
+        if (c.isConnected)      csState.state = 'connected';
+        else if (c.isOutgoing)  csState.state = 'ringing_out';
+        else if (c.isIncoming)  csState.state = 'ringing_in';
+        else if (c.isRinging)   csState.state = 'ringing_out';
+        else                    csState.state = 'idle';
+      }
+    }
+  } catch(e) { csState.csError = String(e.message || e); }
+
+  // Merge DOM signals (element presence only, no text scanning of full body)
+  if (hasEndBtn || hasCallScreen) csState.state = 'connected';
+  else if (hasRingingUI || hasRingingText) csState.state = 'ringing_out';
+
+  csState.dom = {
+    endBtn: hasEndBtn, callScreen: hasCallScreen,
+    ringingUI: hasRingingUI, ringingText: hasRingingText
+  };
+  return csState;
+})()"""
+    ok_r, val = wpp_raw(expr, timeout=8)
+    if not ok_r:
+        return err(str(val))
+    if isinstance(val, dict):
+        return ok(**val)
+    return err(f"unexpected response: {val!r}")
 
 
 @mcp.tool
 def end_call() -> dict:
-    """End the active WhatsApp call (best-effort)."""
+    """End the active WhatsApp call — clicks the hang-up button, falls back to WPP.call API."""
     if (e := _need_ready()):
         return e
-    expr = ("(function(){if(!(window.WPP&&window.WPP.call))throw new Error('call module unavailable');"
-            "var f=window.WPP.call.endCall||window.WPP.call.hangUpCall||window.WPP.call.rejectCall;"
-            "if(!f)throw new Error('endCall unavailable');return Promise.resolve(f.call(window.WPP.call))"
-            ".then(function(){return {ended:true};});})()")
-    return _act("end_call", lambda: wpp_raw(expr))
+    expr = r"""(function() {
+  // Try every known hang-up button selector (DOM-click only — WPP.call.endCall
+  // internally uses CallStore.findFirst which was removed in WA 2.3000+)
+  var selectors = [
+    '[aria-label="End call"]',
+    '[aria-label="Hang up"]',
+    '[aria-label="End video call"]',
+    '[data-icon="call-end"]',
+    '[data-icon="call-decline"]',
+    'button[aria-label*="end" i]',
+    'button[aria-label*="hang" i]'
+  ];
+  for (var i = 0; i < selectors.length; i++) {
+    var btn = document.querySelector(selectors[i]);
+    if (btn) { btn.click(); return Promise.resolve({ended: true, engine: 'ui-click', selector: selectors[i]}); }
+  }
+  return Promise.resolve({ended: false, error: 'no hang-up button found in DOM — call may already be ended'});
+})()"""
+
+    def _do_end():
+        ok_r, val = wpp_raw(expr, timeout=10)
+        if not ok_r:
+            return False, val
+        if isinstance(val, dict):
+            if val.get("ended"):
+                return True, val
+            return False, val.get("error", str(val))
+        return False, f"unexpected relay response: {val!r}"
+
+    return _act("end_call", _do_end)
 
 
 # ============================================================ tools: jobs
@@ -1059,6 +1303,124 @@ def list_jobs(limit: int = 20) -> dict:
 def cancel_job(job_id: str) -> dict:
     """Cancel a queued/running WhatsApp job."""
     return JOBS.cancel(job_id)
+
+
+# ============================================================ tools: inbound auto-answer (F1)
+_ANSWER_WATCHER: dict = {"thread": None, "stop": False, "status": "off"}
+_ANSWER_LOCK = threading.Lock()
+
+_INCOMING_JS = r"""(function() {
+  var W = window.WPP;
+  if (!W || !W.whatsapp || !W.whatsapp.CallStore) return {incoming: false};
+  var arr = W.whatsapp.CallStore.getModelsArray ? W.whatsapp.CallStore.getModelsArray() : [];
+  var c = arr.find(function(x) { return x.isIncoming && !x.isConnected; });
+  if (!c) return {incoming: false};
+  return {incoming: true, callId: c.id || '',
+          from: (c.peerJid && c.peerJid._serialized) || String(c.peerJid || ''),
+          fromNumber: ((c.peerJid && c.peerJid.user) || '').replace(/\D/g,''),
+          isVideo: !!c.isVideo};
+})()"""
+
+_ACCEPT_JS = r"""(function(cid) {
+  if (window.WPP && window.WPP.call) {
+    var f = window.WPP.call.acceptCall || window.WPP.call.accept;
+    if (f) return Promise.resolve(f.call(window.WPP.call, cid))
+      .then(function(){return{accepted:true,engine:'wpp-api'};})
+      .catch(function(e){
+        var b=document.querySelector('[aria-label="Accept video call"],[aria-label="Accept call"]');
+        if(b){b.click();return{accepted:true,engine:'ui-click-fallback'};}
+        return{accepted:false,error:String(e.message||e)};
+      });
+  }
+  var b=document.querySelector('[aria-label="Accept video call"],[aria-label="Accept call"]');
+  if(b){b.click();return Promise.resolve({accepted:true,engine:'ui-click'});}
+  return Promise.resolve({accepted:false,error:'no accept method found'});
+})(__CALL_ID__)"""
+
+
+def _answer_watcher_loop():
+    while True:
+        with _ANSWER_LOCK:
+            if _ANSWER_WATCHER.get("stop"):
+                _ANSWER_WATCHER["status"] = "off"
+                return
+        time.sleep(2)
+        try:
+            ok_r, val = wpp_raw(_INCOMING_JS, timeout=5)
+            if not (ok_r and isinstance(val, dict) and val.get("incoming")):
+                continue
+            call_id = j(val.get("callId", ""))
+            accept_expr = _ACCEPT_JS.replace("__CALL_ID__", call_id)
+            wpp_raw(accept_expr, timeout=8)
+            with _ANSWER_LOCK:
+                _ANSWER_WATCHER["last_answered"] = val
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@mcp.tool
+def answer_calls(on: bool = True) -> dict:
+    """Start or stop the inbound auto-answer watcher.
+
+    When on=True, a background thread polls WhatsApp every 2s for incoming calls and
+    auto-accepts them (using WPP.call.acceptCall or the UI accept button). Combine with
+    call_autopilot to have the agent answer AND hold the conversation.
+    """
+    if (e := _need_ready()):
+        return e
+    with _ANSWER_LOCK:
+        if on:
+            if _ANSWER_WATCHER.get("thread") and _ANSWER_WATCHER["thread"].is_alive():
+                return ok(status="already_watching",
+                          hint="auto-answer is already running; call answer_calls(on=False) to stop")
+            _ANSWER_WATCHER["stop"] = False
+            _ANSWER_WATCHER["status"] = "watching"
+            t = threading.Thread(target=_answer_watcher_loop, daemon=True)
+            _ANSWER_WATCHER["thread"] = t
+            t.start()
+            return ok(status="watching", hint="answering incoming calls automatically")
+        else:
+            _ANSWER_WATCHER["stop"] = True
+            _ANSWER_WATCHER["status"] = "stopping"
+            return ok(status="stopped")
+
+
+@mcp.tool
+def check_incoming_call() -> dict:
+    """Instantly check if there is an incoming WhatsApp call right now.
+
+    Returns incoming=True with caller details if ringing, incoming=False if idle.
+    Useful before manually calling accept_call().
+    """
+    if (e := _need_ready()):
+        return e
+    ok_r, val = wpp_raw(_INCOMING_JS, timeout=6)
+    if not ok_r:
+        return err(str(val))
+    return ok(**val) if isinstance(val, dict) else err(f"unexpected: {val!r}")
+
+
+@mcp.tool
+def accept_call(call_id: str = "") -> dict:
+    """Manually accept an active incoming WhatsApp call.
+
+    call_id is optional — if omitted, accepts the first incoming call found.
+    """
+    if (e := _need_ready()):
+        return e
+    cid = call_id.strip()
+    if not cid:
+        # Discover the call id first
+        ok_r, val = wpp_raw(_INCOMING_JS, timeout=6)
+        if ok_r and isinstance(val, dict) and val.get("incoming"):
+            cid = val.get("callId", "")
+        if not cid:
+            return err("no incoming call found")
+    expr = _ACCEPT_JS.replace("__CALL_ID__", j(cid))
+    ok_r, val = wpp_raw(expr, timeout=10)
+    if not ok_r:
+        return err(str(val))
+    return ok(**val) if isinstance(val, dict) else err(f"unexpected: {val!r}")
 
 
 if __name__ == "__main__":

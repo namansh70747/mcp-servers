@@ -25,7 +25,7 @@ EXPECTED = [
     "enroll_voice", "compare_voices", "choose_voice",
     "clone_voice", "set_voice",
     "start_session", "next_utterance", "say_now", "live_transcript", "session_status", "stop_session",
-    "call_brief", "call_autopilot", "call_status",
+    "call_brief", "call_autopilot", "call_status", "call_sequence", "schedule_call", "selftest",
 ]
 
 

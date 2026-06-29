@@ -1,0 +1,580 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║            HERMES MCP CONFIGURATION — Comprehensive MCP Suite               ║
+# ║                   Auto-generated from mcp-servers/.mcp.json                  ║
+# ║                        65 MCP Servers · 672+ Tools                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+mcp_servers:
+
+  # ─── Ready-made ───
+  filesystem:
+    command: "npx"
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-filesystem"
+      - "/Users/namansharma/mcp-servers"
+  git:
+    command: "/Users/namansharma/.local/bin/uvx"
+    args:
+      - "mcp-server-git"
+      - "--repository"
+      - "/Users/namansharma/mcp-servers"
+  github:
+    command: "/Users/namansharma/mcp-servers/bin/github-mcp-server"
+    args:
+      - "stdio"
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+  google_workspace:
+    command: "/Users/namansharma/.local/bin/uvx"
+    args:
+      - "workspace-mcp"
+      - "--tool-tier"
+      - "core"
+    env:
+      GOOGLE_OAUTH_CLIENT_ID: "${GOOGLE_OAUTH_CLIENT_ID}"
+      GOOGLE_OAUTH_CLIENT_SECRET: "${GOOGLE_OAUTH_CLIENT_SECRET}"
+      OAUTHLIB_INSECURE_TRANSPORT: "1"
+  memory:
+    command: "npx"
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-memory"
+  playwright:
+    command: "npx"
+    args:
+      - "-y"
+      - "@playwright/mcp@latest"
+
+  # ─── macOS Ready-made ───
+  applescript:
+    command: "npx"
+    args:
+      - "-y"
+      - "@peakmojo/applescript-mcp"
+  shortcuts:
+    command: "npx"
+    args:
+      - "-y"
+      - "mcp-server-apple-shortcuts"
+  messages:
+    command: "/Users/namansharma/.local/bin/uvx"
+    args:
+      - "mac-messages-mcp"
+  apple-events:
+    command: "npx"
+    args:
+      - "-y"
+      - "mcp-server-apple-events"
+  apple-notes:
+    command: "npx"
+    args:
+      - "-y"
+      - "@griches/apple-notes-mcp"
+  screenshot:
+    command: "npx"
+    args:
+      - "-y"
+      - "@kazuph/mcp-screenshot"
+  spotlight:
+    command: "/Users/namansharma/.local/bin/uvx"
+    args:
+      - "mcp-server-everything-search"
+
+  # ─── Dev Tools ───
+  api-tester:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/api-tester/server.py"
+
+  # ─── Outreach ───
+  apollo:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/apollo/server.py"
+
+  # ─── System ───
+  background:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/background/server.py"
+
+  # ─── Career ───
+  blog-drafter:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/blog-drafter/server.py"
+
+  # ─── Productivity ───
+  bookmark-vault:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/bookmark-vault/server.py"
+
+  # ─── System ───
+  browser:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/browser/server.py"
+
+  # ─── Outreach ───
+  campaign:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/campaign/server.py"
+
+  # ─── System ───
+  chrome:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/chrome/server.py"
+
+  # ─── Dev Tools ───
+  codeedit:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/codeedit/server.py"
+  codeindex:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/codeindex/server.py"
+
+  # ─── Outreach ───
+  contacts:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/contacts/server.py"
+
+  # ─── Productivity ───
+  daily-digest:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/daily-digest/server.py"
+
+  # ─── Career ───
+  deckforge:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/deckforge/server.py"
+
+  # ─── System ───
+  deskpilot:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/deskpilot/server.py"
+
+  # ─── Dev Tools ───
+  devlog:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/devlog/server.py"
+
+  # ─── Outreach ───
+  email-finder:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/email-finder/server.py"
+  emailcheck:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/emailcheck/server.py"
+
+  # ─── Productivity ───
+  expense-tracker:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/expense-tracker/server.py"
+
+  # ─── Outreach ───
+  funding-radar:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/funding-radar/server.py"
+
+  # ─── Dev Tools ───
+  gitflow:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/gitflow/server.py"
+
+  # ─── Career ───
+  github-profile:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/github-profile/server.py"
+
+  # ─── System ───
+  homebrew:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/homebrew/server.py"
+
+  # ─── Communication ───
+  hub:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/hub/server.py"
+
+  # ─── Career ───
+  interview-prep:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/interview-prep/server.py"
+
+  # ─── Other ───
+  jobtrack:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/jobtrack/server.py"
+
+  # ─── Productivity ───
+  learn-tracker:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/learn-tracker/server.py"
+
+  # ─── Career ───
+  linkedin-optimizer:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/linkedin-optimizer/server.py"
+
+  # ─── System ───
+  mac-control:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/mac-control/server.py"
+
+  # ─── Outreach ───
+  mailbox:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/mailbox/server.py"
+  mailmerge:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/mailmerge/server.py"
+
+  # ─── Productivity ───
+  meeting-prep:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/meeting-prep/server.py"
+  news-radar:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/news-radar/server.py"
+  notes:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/notes/server.py"
+
+  # ─── Outreach ───
+  pitchbuilder:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/pitchbuilder/server.py"
+
+  # ─── Career ───
+  portfolio-site:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/portfolio-site/server.py"
+
+  # ─── Dev Tools ───
+  project-memory:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/project-memory/server.py"
+
+  # ─── Outreach ───
+  reachout:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/reachout/server.py"
+
+  # ─── Dev Tools ───
+  readme-changelog:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/readme-changelog/server.py"
+  recipes:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/recipes/server.py"
+  repo-health:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/repo-health/server.py"
+
+  # ─── Career ───
+  resume-forge:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/resume-forge/server.py"
+
+  # ─── Productivity ───
+  rss-reader:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/rss-reader/server.py"
+
+  # ─── Dev Tools ───
+  scaffold:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/scaffold/server.py"
+
+  # ─── Productivity ───
+  snippet-vault:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/snippet-vault/server.py"
+
+  # ─── Media ───
+  spotify:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/spotify/server.py"
+
+  # ─── Productivity ───
+  task-manager:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/task-manager/server.py"
+  time-tracker:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/time-tracker/server.py"
+
+  # ─── Media ───
+  videoforge:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/videoforge/server.py"
+  voice:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/voice/server.py"
+  webengine:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/webengine/server.py"
+  webscrape:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/webscrape/server.py"
+
+  # ─── Communication ───
+  whatsapp:
+    command: "/Users/namansharma/.local/bin/uv"
+    args:
+      - "run"
+      - "--project"
+      - "/Users/namansharma/mcp-servers"
+      - "python"
+      - "/Users/namansharma/mcp-servers/servers/whatsapp/server.py"

@@ -1,0 +1,44 @@
+{
+  "mcpServers": {
+    "voice": {
+      "command": "/Users/namansharma/.local/bin/uv",
+      "args": [
+        "run",
+        "--project",
+        "/Users/namansharma/mcp-servers",
+        "python",
+        "/Users/namansharma/mcp-servers/servers/voice/server.py"
+      ]
+    },
+    "whatsapp": {
+      "command": "/Users/namansharma/.local/bin/uv",
+      "args": [
+        "run",
+        "--project",
+        "/Users/namansharma/mcp-servers",
+        "python",
+        "/Users/namansharma/mcp-servers/servers/whatsapp/server.py"
+      ]
+    },
+    "mac-control": {
+      "command": "/Users/namansharma/.local/bin/uv",
+      "args": [
+        "run",
+        "--project",
+        "/Users/namansharma/mcp-servers",
+        "python",
+        "/Users/namansharma/mcp-servers/servers/mac-control/server.py"
+      ]
+    },
+    "notes": {
+      "command": "/Users/namansharma/.local/bin/uv",
+      "args": [
+        "run",
+        "--project",
+        "/Users/namansharma/mcp-servers",
+        "python",
+        "/Users/namansharma/mcp-servers/servers/notes/server.py"
+      ]
+    }
+  }
+}
