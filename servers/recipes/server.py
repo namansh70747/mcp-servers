@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from mcp_base import base_data_dir, err, make_server, ok
+from mcp_base import base_data_dir, default_repo, err, make_server, ok, resolve_project
 
 mcp = make_server(
     "recipes",
@@ -18,17 +18,29 @@ mcp = make_server(
 )
 
 
-def _step(server: str, tool: str, args: dict | None = None, why: str = "") -> dict:
-    return {"server": server, "tool": tool, "args": args or {}, "why": why}
+def _step(server: str, tool: str, args: dict | None = None, why: str = "",
+          output_key: str | None = None, input_from: str | None = None,
+          on_error: str = "stop") -> dict:
+    s: dict = {"server": server, "tool": tool, "args": args or {}, "why": why}
+    if output_key:
+        s["output_key"] = output_key
+    if input_from:
+        s["input_from"] = input_from
+    if on_error:
+        s["on_error"] = on_error
+    return s
 
 
 # ----------------------------- Playbooks -----------------------------
 RECIPES = {
     "weekly_outreach": "Plan a week of cold outreach: find leads, draft, queue, schedule follow-ups.",
+    "bulk_ceo_outreach": "Bulk CEO email discovery + validate + draft outreach for a company list.",
     "prep_for_company": "Research a target company end-to-end before reaching out or interviewing.",
     "apply_to_job": "Turn a job description into a tailored resume + cover letter + tracked application.",
     "daily_briefing": "Morning briefing: unread feeds, today's tasks, habits, calendar, follow-ups due.",
     "ship_project": "Pre-ship checklist for a repo: health, README/changelog, devlog, memory checkpoint.",
+    "contribute_upstream": "Fork upstream, branch, push, and open a PR from your fork.",
+    "triage_issue": "File a GitHub issue and track it in project-memory + task-manager.",
 }
 
 
@@ -45,25 +57,79 @@ def weekly_outreach() -> dict:
     reachout/contacts. Execute the steps in order, feeding outputs forward."""
     steps = [
         _step("funding-radar", "list_leads", {"limit": 25},
-              "Surface freshly-funded companies worth contacting this week."),
-        _step("apollo", "find_people", {"domain": "<company-domain>", "limit": 25},
-              "Find decision-maker leads at each target company (pass its domain)."),
-        _step("email-finder", "find", {"name": "<lead-name>", "company": "<company>"},
-              "Resolve a likely email address for each lead missing one."),
+              why="Surface freshly-funded companies worth contacting this week.",
+              output_key="leads"),
+        _step("campaign", "filter_uncontacted", {"companies": "<from leads.fresh>"},
+              why="Dedup gate — drop already-contacted and suppressed companies.",
+              output_key="filtered", input_from="leads.fresh"),
+        _step("apollo", "ensure_ready", {},
+              why="Auto-start CDP browser + Google login from .env.",
+              output_key="apollo_ready"),
+        _step("apollo", "bulk_find_ceo_email",
+              {"companies": "<from filtered.fresh>", "persist_contacts": True},
+              why="Apollo Access Email per company (Path 1 fast; extension only on miss).",
+              output_key="ceo_emails", input_from="filtered.fresh"),
         _step("emailcheck", "validate_email", {"email": "<found-email>"},
-              "Verify deliverability before sending to protect sender reputation."),
-        _step("contacts", "add_contact", {"name": "<lead-name>", "company": "<company>", "email": "<found-email>"},
-              "Persist each verified lead as a contact for tracking."),
+              why="Verify deliverability before sending to protect sender reputation.",
+              input_from="ceo_emails.results[0].email"),
+        _step("contacts", "add_contact",
+              {"name": "<lead-name>", "company": "<company>", "email": "<found-email>"},
+              why="Persist each verified lead as a contact for tracking.",
+              input_from="ceo_emails.results[0]"),
         _step("reachout", "create_draft",
-              {"to_email": "<found-email>", "subject": "<subject>", "body": "<personalized-body>"},
-              "Draft a personalized first-touch email per contact."),
+              {"to_email": "<found-email>", "subject": "<subject>", "body": "<personalized-body>",
+               "company": "<company>"},
+              why="Draft a personalized first-touch email per contact.",
+              output_key="draft"),
         _step("reachout", "schedule_send", {"outreach_id": "<from create_draft>", "run_at": "<iso-datetime>"},
-              "Queue sends spread across the week."),
+              why="Queue sends spread across the week.",
+              input_from="draft.outreach_id"),
+        _step("reachout", "send_draft", {"draft_id": "<draft_id>", "sync_campaign": True},
+              why="Send approved drafts and sync the campaign ledger.",
+              input_from="draft.draft_id"),
+        _step("campaign", "record_outreach",
+              {"company": "<company>", "domain": "<company-domain>", "email": "<found-email>"},
+              why="Record outreach in the dedup ledger after send."),
         _step("reachout", "thread_followup",
               {"outreach_id": "<from create_draft>", "template_name": "<followup-template>"},
-              "Queue a follow-up for non-repliers."),
+              why="Queue a follow-up for non-repliers.",
+              input_from="draft.outreach_id"),
     ]
     return ok(recipe="weekly_outreach", steps=steps)
+
+
+@mcp.tool
+def bulk_ceo_outreach(companies: list[dict] | None = None) -> dict:
+    """Bulk CEO email discovery + validate + draft outreach for a company list.
+    Each company: {domain, company?}. Uses apollo.bulk_find_ceo_email (Path 1 fast, extension on miss)."""
+    steps = [
+        _step("campaign", "filter_uncontacted", {"companies": companies or "<companies>"},
+              why="Dedup gate — drop already-contacted and suppressed companies.",
+              output_key="filtered"),
+        _step("apollo", "ensure_ready", {},
+              why="Auto-start CDP browser; user clicks Apollo FAB once per session on LinkedIn.",
+              output_key="apollo_ready"),
+        _step("apollo", "bulk_find_ceo_email",
+              {"companies": "<from filtered.fresh>", "persist_contacts": True},
+              why="CEO emails via Apollo Access Email; extension only when app search misses.",
+              output_key="ceo_emails", input_from="filtered.fresh"),
+        _step("emailcheck", "validate_email", {"email": "<found-email>"},
+              why="Verify deliverability per found email.",
+              input_from="ceo_emails.results"),
+        _step("reachout", "create_draft",
+              {"to_email": "<found-email>", "subject": "<subject>", "body": "<personalized-body>",
+               "company": "<company>", "recipient_name": "<ceo-name>"},
+              why="Draft personalized outreach per CEO email found.",
+              input_from="ceo_emails.results"),
+        _step("campaign", "record_outreach",
+              {"company": "<company>", "domain": "<company-domain>", "email": "<found-email>"},
+              why="Record outreach in dedup ledger after send.",
+              input_from="ceo_emails.results"),
+        _step("mailmerge", "import_csv",
+              {"source": "<bulk-results-csv>", "email_column": "email"},
+              why="Optional: import bulk CEO results for mailmerge render_batch + throttle."),
+    ]
+    return ok(recipe="bulk_ceo_outreach", steps=steps)
 
 
 @mcp.tool
@@ -116,18 +182,20 @@ def daily_briefing() -> dict:
     """Return a step plan for a morning briefing: unread feeds, today's tasks, habits due, calendar,
     and outreach follow-ups due."""
     steps = [
+        _step("daily-digest", "today", {},
+              why="Aggregated view of everything needing action today."),
         _step("rss-reader", "unread", {"limit": 15},
-              "What's new in your feeds."),
+              why="What's new in your feeds."),
         _step("task-manager", "agenda", {},
-              "Tasks due today."),
+              why="Tasks due today."),
         _step("habit-tracker", "today", {},
-              "Habits to keep streaks alive."),
+              why="Habits to keep streaks alive."),
         _step("time-tracker", "daily_report", {},
-              "Where yesterday's time went."),
+              why="Where yesterday's time went."),
         _step("reachout", "list_followups_due", {},
-              "Outreach follow-ups that need to go out today."),
+              why="Outreach follow-ups that need to go out today."),
         _step("expense-tracker", "budget_status", {},
-              "Quick check on this month's budgets."),
+              why="Quick check on this month's budgets."),
     ]
     return ok(recipe="daily_briefing", steps=steps)
 
@@ -139,17 +207,19 @@ def ship_project(repo: str) -> dict:
     repo = (repo or "").strip()
     steps = [
         _step("repo-health", "health_report", {"repo": repo},
-              "Run health checks (tests, lint, deps, license)."),
+              why="Run health checks (tests, lint, deps, license)."),
+        _step("readme-changelog", "lint_commits", {"repo": repo},
+              why="Lint commit messages before shipping."),
         _step("readme-changelog", "gen_readme", {"repo": repo},
-              "Refresh the README."),
+              why="Refresh the README."),
         _step("readme-changelog", "gen_changelog", {"repo": repo},
-              "Generate a changelog entry."),
+              why="Generate a changelog entry."),
         _step("codeindex", "reindex", {"project": repo},
-              "Re-index the codebase so search is current."),
+              why="Re-index the codebase so search is current."),
         _step("devlog", "weekly_summary", {"repo": repo},
-              "Log what shipped in this cycle."),
+              why="Log what shipped in this cycle."),
         _step("project-memory", "checkpoint", {"summary": "<what shipped>", "project": repo},
-              "Snapshot project state for future context."),
+              why="Snapshot project state for future context."),
     ]
     return ok(recipe="ship_project", repo=repo, steps=steps)
 
@@ -376,56 +446,63 @@ def plan_edits(task: str, repo: str | None = None) -> dict:
 
 
 @mcp.tool
-def make_change(task: str) -> dict:
+def make_change(task: str, repo: str | None = None) -> dict:
     """Return a step plan to safely make a code change for `task`: gather context, branch, apply a
     validated patch, run tests, then stage + commit. Execute in order, feeding outputs forward."""
     task = (task or "").strip()
+    project = repo or default_repo()
     steps = [
-        _step("codeindex", "relevant_context", {"task": task},
-              "Pull the right files/symbols for this task before editing."),
-        _step("gitflow", "current_branch", {},
-              "Confirm the working branch (create_branch first if you should not edit the default)."),
+        _step("codeindex", "relevant_context", {"task": task, "project": project},
+              why="Pull the right files/symbols for this task before editing."),
+        _step("gitflow", "create_branch", {"repo": project, "name": "<feature-branch>"},
+              why="Create a feature branch before editing."),
+        _step("gitflow", "current_branch", {"repo": project},
+              why="Confirm the working branch."),
         _step("codeedit", "preview_patch", {"path": "<file>", "patch": "<unified-diff>"},
-              "Preview the change before touching disk."),
+              why="Preview the change before touching disk."),
         _step("codeedit", "apply_patch", {"path": "<file>", "patch": "<unified-diff>", "validate": True},
-              "Apply the patch with validation so a syntax error can't land."),
+              why="Apply the patch with validation so a syntax error can't land."),
         _step("codeedit", "run_tests", {},
-              "Run the test suite to confirm the change is green."),
-        _step("gitflow", "stage", {"paths": ["<changed-file>"]},
-              "Stage the edited files."),
-        _step("gitflow", "commit", {"message": f"<concise message for: {task[:80]}>"},
-              "Commit the staged change."),
+              why="Run the test suite to confirm the change is green."),
+        _step("gitflow", "stage", {"repo": project, "paths": ["<changed-file>"]},
+              why="Stage the edited files."),
+        _step("gitflow", "commit", {"repo": project, "message": f"<concise message for: {task[:80]}>"},
+              why="Commit the staged change."),
     ]
-    return ok(recipe="make_change", task=task, steps=steps)
+    return ok(recipe="make_change", task=task, repo=project, steps=steps)
 
 
 @mcp.tool
-def review_and_pr(task: str) -> dict:
+def review_and_pr(task: str, repo: str | None = None) -> dict:
     """Return a step plan to review a change and open a PR for `task`: gather context, validate-edit,
     test, stage, commit, push, draft a PR body, then open the PR. Execute in order."""
     task = (task or "").strip()
+    project = repo or default_repo()
     steps = [
-        _step("codeindex", "relevant_context", {"task": task},
-              "Pull the right files/symbols for this task before editing."),
+        _step("codeindex", "relevant_context", {"task": task, "project": project},
+              why="Pull the right files/symbols for this task before editing."),
+        _step("gitflow", "create_branch", {"repo": project, "name": "<feature-branch>"},
+              why="Create a feature branch for this change."),
         _step("codeedit", "apply_patch", {"path": "<file>", "patch": "<unified-diff>", "validate": True},
-              "Apply the patch with validation so a syntax error can't land."),
+              why="Apply the patch with validation so a syntax error can't land."),
         _step("codeedit", "run_tests", {},
-              "Run the test suite to confirm the change is green."),
-        _step("gitflow", "stage", {"paths": ["<changed-file>"]},
-              "Stage the edited files."),
-        _step("gitflow", "commit", {"message": f"<concise message for: {task[:80]}>"},
-              "Commit the staged change."),
-        _step("gitflow", "push", {},
-              "Push the branch to the remote so a PR can be opened."),
-        _step("gitflow", "diff", {},
-              "Review the final diff before drafting the PR description."),
-        _step("gitflow", "pr_body", {"task": task},
-              "Draft a PR title/body from the diff and task."),
-        _step("gitflow", "open_pr", {"title": f"<title for: {task[:80]}>", "body": "<from pr_body>"},
-              "Open the pull request (use github.create_pull_request if a hosted GitHub tool is "
-              "available instead)."),
+              why="Run the test suite to confirm the change is green."),
+        _step("gitflow", "stage", {"repo": project, "paths": ["<changed-file>"]},
+              why="Stage the edited files."),
+        _step("gitflow", "commit", {"repo": project, "message": f"<concise message for: {task[:80]}>"},
+              why="Commit the staged change."),
+        _step("gitflow", "push", {"repo": project},
+              why="Push the branch to the remote so a PR can be opened."),
+        _step("gitflow", "diff", {"repo": project},
+              why="Review the final diff before drafting the PR description."),
+        _step("gitflow", "pr_body", {"repo": project, "task": task},
+              why="Draft a PR title/body from the diff and task.", output_key="pr"),
+        _step("gitflow", "open_pr",
+              {"repo": project, "title": "<from pr.title>", "body": "<from pr.body>"},
+              why="Open the pull request (or use github.create_pull_request fallback).",
+              input_from="pr.title"),
     ]
-    return ok(recipe="review_and_pr", task=task, steps=steps)
+    return ok(recipe="review_and_pr", task=task, repo=project, steps=steps)
 
 
 # ----------------------------- suite guide / discovery -----------------------------
@@ -445,7 +522,253 @@ _SERVER_ROLES = {
 }
 
 
-def _suite_briefing() -> dict:
+# Make the new playbooks discoverable from list_recipes too (without changing its return shape).
+RECIPES.update({
+    "make_change": "Safely make a code change: context -> validated edit -> tests -> commit.",
+    "review_and_pr": "Review a change and open a PR: make_change -> push -> pr_body -> open_pr.",
+    "contribute_upstream": "Fork upstream, branch, push, and open a PR from your fork.",
+    "triage_issue": "File a GitHub issue and track it in project-memory + task-manager.",
+})
+
+
+# ----------------------------- executor + session bootstrap -----------------------------
+
+PLAYBOOK_CALLS: dict[str, tuple[str, ...]] = {
+    "weekly_outreach": (),
+    "bulk_ceo_outreach": (),
+    "prep_for_company": ("company",),
+    "apply_to_job": ("jd_text",),
+    "daily_briefing": (),
+    "ship_project": ("repo",),
+    "make_change": ("task", "repo"),
+    "review_and_pr": ("task", "repo"),
+    "contribute_upstream": ("upstream_owner", "upstream_repo", "task"),
+    "triage_issue": ("repo", "title", "body"),
+    "prime_session": ("project", "task"),
+}
+
+
+def _invoke_playbook(name: str, params: dict) -> dict:
+    """Call a playbook function by name with params."""
+    fn = globals().get(name)
+    if not fn or not callable(fn):
+        return err(f"unknown recipe: {name}", available=list(PLAYBOOK_CALLS))
+    keys = PLAYBOOK_CALLS.get(name)
+    if keys is None:
+        return err(f"unknown recipe: {name}", available=list(PLAYBOOK_CALLS))
+    if not keys:
+        return fn()
+    if name == "prime_session":
+        return fn(params.get("project"), params.get("task"))
+    if name in ("make_change", "review_and_pr"):
+        return fn(params.get("task", ""), params.get("repo"))
+    args = []
+    for k in keys:
+        val = params.get(k)
+        if k in ("company", "jd_text", "task", "repo", "upstream_owner", "upstream_repo",
+                 "title", "body") and not (val or "").strip() and k in params:
+            pass
+        args.append(val if val is not None else "")
+    return fn(*args)
+
+
+def _deep_get(obj: dict, path: str):
+    cur = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _apply_input_from(step: dict, outputs: dict) -> dict:
+    args = dict(step.get("args") or {})
+    spec = step.get("input_from")
+    if not spec:
+        return args
+    val = _deep_get(outputs, spec)
+    if val is None and "." in spec:
+        key, field = spec.rsplit(".", 1)
+        src = outputs.get(key, {})
+        if isinstance(src, dict):
+            val = src.get(field)
+    if val is None:
+        return args
+    for k, v in list(args.items()):
+        if isinstance(v, str) and ("<from" in v or v.startswith("<") and v.endswith(">")):
+            args[k] = val
+    if isinstance(val, (str, int, float, bool)):
+        leaf = spec.rsplit(".", 1)[-1]
+        if leaf not in args or str(args.get(leaf, "")).startswith("<"):
+            args[leaf] = val
+    return args
+
+
+def _resolve_steps(steps: list[dict], outputs: dict | None = None) -> list[dict]:
+    """Resolve input_from chains for dry_run display."""
+    outputs = outputs or {}
+    resolved = []
+    for step in steps:
+        s = dict(step)
+        s["args"] = _apply_input_from(step, outputs)
+        resolved.append(s)
+        key = step.get("output_key") or f"{step['server']}.{step['tool']}"
+        outputs[key] = outputs.get(key, {})
+    return resolved
+
+
+def _load_server_mcp(server_name: str):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    sp = Path(__file__).resolve().parent.parent / server_name / "server.py"
+    if not sp.exists():
+        return None, f"no server.py for {server_name}"
+    mod_name = f"_recipes_run_{server_name.replace('-', '_')}"
+    spec = importlib.util.spec_from_file_location(mod_name, sp)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    srv = getattr(mod, "mcp", None)
+    if srv is None:
+        return None, f"{server_name} has no mcp"
+    return srv, None
+
+
+@mcp.tool
+def resolve_tool(server: str, tool: str, hub_mode: bool = False) -> dict:
+    """Return the tool name to call — namespaced when hub_mode is active."""
+    if hub_mode:
+        return ok(server=server, tool=tool, resolved=f"{server}_{tool}", hub_mode=True)
+    return ok(server=server, tool=tool, resolved=tool, hub_mode=False)
+
+
+@mcp.tool
+def run(recipe: str, params: dict | None = None, dry_run: bool = False,
+        stop_on_error: bool = True) -> dict:
+    """Execute a playbook step-by-step via in-process FastMCP clients, or dry_run the resolved plan."""
+    import asyncio
+
+    from fastmcp import Client
+
+    params = params or {}
+    plan = _invoke_playbook(recipe, params)
+    if not plan.get("ok"):
+        return plan
+    steps = plan.get("steps") or []
+    if dry_run:
+        return ok(recipe=recipe, dry_run=True, steps=_resolve_steps(steps),
+                  steps_count=len(steps))
+
+    async def _exec():
+        outputs: dict = {}
+        results: list[dict] = []
+        for i, step in enumerate(steps):
+            srv_name = step["server"]
+            tool_name = step["tool"]
+            args = _apply_input_from(step, outputs)
+            mcp_srv, load_err = _load_server_mcp(srv_name)
+            if mcp_srv is None:
+                return ok(ok=False, failed_at=i, error=load_err, steps_completed=i,
+                          results=results, partial_context=outputs)
+            try:
+                async with Client(mcp_srv) as c:
+                    res = await c.call_tool(tool_name, args)
+                    data = res.data if hasattr(res, "data") else res
+            except Exception as e:  # noqa: BLE001
+                data = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            key = step.get("output_key") or f"{srv_name}.{tool_name}"
+            outputs[key] = data
+            results.append({"step": i, "server": srv_name, "tool": tool_name, "result": data})
+            if isinstance(data, dict) and data.get("ok") is False and stop_on_error:
+                return ok(ok=False, failed_at=i, steps_completed=i, results=results,
+                          partial_context=outputs, error=data.get("error"))
+        return ok(ok=True, steps_completed=len(steps), results=results, partial_context=outputs)
+
+    return asyncio.run(_exec())
+
+
+@mcp.tool
+def prime_session(project: str | None = None, task: str | None = None) -> dict:
+    """Session bootstrap: index (if needed), resume memory, pull relevant context, export files."""
+    proj = resolve_project(project)
+    if isinstance(proj, dict):
+        return proj
+    steps = [
+        _step("codeindex", "index_project", {"path": proj},
+              why="Ensure the repo is indexed (re-run if stale).", output_key="index"),
+        _step("project-memory", "resume", {"project": proj},
+              why="Rehydrate prior decisions, todos, and conventions.", output_key="memory"),
+    ]
+    if task and task.strip():
+        steps.append(_step("codeindex", "relevant_context", {"task": task.strip(), "project": proj},
+                           why="Pull task-relevant files/symbols.", output_key="context"))
+    steps += [
+        _step("codeindex", "export_context_file", {"project": proj, "write": True},
+              why="Write .cursor/context if missing or stale."),
+        _step("project-memory", "export_digest", {"project": proj, "write": True, "prime_clients": True},
+              why="Export MEMORY.md for client priming."),
+    ]
+    return ok(recipe="prime_session", project=proj, task=task, steps=steps,
+              note="Call recipes.run('prime_session', {project, task}) or execute steps manually.")
+
+
+@mcp.tool
+def contribute_upstream(upstream_owner: str, upstream_repo: str, task: str) -> dict:
+    """OSS contribution flow: fork upstream, branch, commit, push to fork, open PR."""
+    task = (task or "").strip()
+    upstream_owner = (upstream_owner or "").strip()
+    upstream_repo = (upstream_repo or "").strip()
+    branch = "<feature-branch>"
+    steps = [
+        _step("github", "fork_repository",
+              {"owner": upstream_owner, "repo": upstream_repo},
+              why="Fork the upstream repo to your GitHub account.", output_key="fork"),
+        _step("gitflow", "add_remote",
+              {"name": "upstream", "url": f"https://github.com/{upstream_owner}/{upstream_repo}.git"},
+              why="Add upstream remote for sync."),
+        _step("gitflow", "create_branch", {"name": branch},
+              why="Create a feature branch for your change."),
+        _step("codeindex", "relevant_context", {"task": task},
+              why="Gather context before editing."),
+        _step("codeedit", "apply_patch", {"path": "<file>", "patch": "<unified-diff>", "validate": True},
+              why="Apply the validated change."),
+        _step("codeedit", "run_tests", {}, why="Confirm tests pass."),
+        _step("gitflow", "stage", {"paths": ["<changed-file>"]}, why="Stage changes."),
+        _step("gitflow", "commit", {"message": f"<message for: {task[:80]}>"}, why="Commit."),
+        _step("gitflow", "push", {"branch": branch, "remote": "origin"},
+              why="Push branch to your fork."),
+        _step("gitflow", "open_pr",
+              {"title": f"<title for: {task[:80]}>", "body": "<from pr_body>",
+               "base": "main", "head": f"namansh70747:{branch}"},
+              why="Open PR from fork to upstream (head=youruser:branch)."),
+        _step("gitflow", "pr_body", {"task": task}, why="Generate PR body with task context.",
+              output_key="pr"),
+    ]
+    return ok(recipe="contribute_upstream", upstream=f"{upstream_owner}/{upstream_repo}",
+              task=task, steps=steps)
+
+
+@mcp.tool
+def triage_issue(repo: str, title: str, body: str) -> dict:
+    """File a GitHub issue and track it locally."""
+    project = repo or default_repo()
+    steps = [
+        _step("github", "issue_write",
+              {"owner": "<owner>", "repo": "<repo>", "title": title, "body": body},
+              why="Create the GitHub issue.", output_key="issue"),
+        _step("project-memory", "remember",
+              {"note": f"Issue: {title}", "kind": "todo", "project": project},
+              why="Remember the issue in project memory."),
+        _step("task-manager", "add_task",
+              {"title": title, "notes": body},
+              why="Add a tracked task for follow-up."),
+    ]
+    return ok(recipe="triage_issue", repo=project, title=title, steps=steps)
+
+
+def _suite_briefing(hub_mode: bool = False) -> dict:
     return ok(
         title="How to drive this MCP suite",
         first_steps=[
@@ -469,22 +792,23 @@ def _suite_briefing() -> dict:
             {"name": "plan_edits", "description": "index-grounded ordered edit steps for a task."},
         ],
         servers=_SERVER_ROLES,
-        note="Each playbook RETURNS a plan ({server,tool,args,why}); you execute the steps yourself. "
+        note="Each playbook RETURNS a plan ({server,tool,args,why}); you execute the steps yourself "
+             "or call recipes.run(recipe, params). Hub tools are prefixed server_tool when "
+             f"hub_mode=True (e.g. codeindex_search). hub_mode={hub_mode}. "
              "Call recipes.capabilities() to discover the full {server: [tools]} map.",
     )
 
 
 @mcp.tool
-def start_here() -> dict:
-    """Canonical briefing on how to drive this suite: first steps (index_project, project-memory.resume,
-    relevant_context), the edit->validate->commit->PR loop, and what each server does."""
-    return _suite_briefing()
+def start_here(hub_mode: bool = False) -> dict:
+    """Canonical briefing on how to drive this suite: first steps, edit loop, playbooks, hub naming."""
+    return _suite_briefing(hub_mode=hub_mode)
 
 
 @mcp.tool
-def suite_guide() -> dict:
+def suite_guide(hub_mode: bool = False) -> dict:
     """Alias for start_here(): the canonical 'how to drive this suite' briefing."""
-    return _suite_briefing()
+    return _suite_briefing(hub_mode=hub_mode)
 
 
 @mcp.tool
@@ -531,13 +855,6 @@ def capabilities() -> dict:
     return ok(servers=out, count=len(out),
               total_tools=sum(len(v) for v in out.values()),
               unavailable=unavailable)
-
-
-# Make the new playbooks discoverable from list_recipes too (without changing its return shape).
-RECIPES.update({
-    "make_change": "Safely make a code change: context -> validated edit -> tests -> commit.",
-    "review_and_pr": "Review a change and open a PR: make_change -> push -> pr_body -> open_pr.",
-})
 
 
 if __name__ == "__main__":

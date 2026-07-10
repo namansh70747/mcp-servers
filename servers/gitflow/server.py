@@ -27,7 +27,7 @@ mcp = make_server(
         "Local git -> PR bridge. status/current_branch/create_branch/stage/commit/push/"
         "diff/log on a repo path, then pr_body to synthesize a PR title+markdown from the "
         "diff, then open_pr (uses `gh` if installed, else returns a ready-to-run command "
-        "and the github-server tool to call). All ops are local subprocess git; safe to "
+        "and the github MCP tool to call). All ops are local subprocess git; safe to "
         "call read-only ops (status/diff/log) freely."
     ),
 )
@@ -115,7 +115,126 @@ def _valid_ref(ref: str) -> bool:
         and ".." not in ref and bool(_REF_RE.match(ref))
 
 
+def _valid_head_ref(head: str) -> bool:
+    """Allow fork PR heads like owner:branch in addition to local branch names."""
+    if ":" in head:
+        owner, branch = head.split(":", 1)
+        return bool(owner.strip()) and _valid_refname(branch)
+    return _valid_refname(head)
+
+
+def _parse_remote_url(url: str) -> tuple[str | None, str | None]:
+    """Parse owner/repo from a GitHub remote URL."""
+    if not url:
+        return None, None
+    u = url.strip().rstrip("/")
+    if u.endswith(".git"):
+        u = u[:-4]
+    # git@github.com:owner/repo
+    m = re.match(r"^git@[^:]+:([^/]+)/(.+)$", u)
+    if m:
+        return m.group(1), m.group(2)
+    # https://github.com/owner/repo
+    m = re.match(r"^https?://[^/]+/([^/]+)/(.+)$", u)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
+def _remote_url(repo: str, remote: str = "origin") -> str | None:
+    r = _run(repo, ["remote", "get-url", remote])
+    return r.get("out") if r.get("rc") == 0 else None
+
+
 # ---------------------------------------------------------------- tools
+@mcp.tool
+def remote_owner_repo(repo: str = ".", remote: str = "origin") -> dict:
+    """Parse `remote` URL into {owner, repo}. Used for GitHub MCP fallbacks and fork PRs."""
+    repo, e = _resolve_repo(repo)
+    if e:
+        return e
+    if not _is_repo(repo):
+        return _not_repo_err(repo)
+    url = _remote_url(repo, remote)
+    if not url:
+        return err(f"no remote '{remote}' or empty URL", hint="git remote add origin <url>")
+    owner, name = _parse_remote_url(url)
+    if not owner or not name:
+        return err(f"could not parse owner/repo from: {url}")
+    return ok(owner=owner, repo=name, remote=remote, remote_url=url)
+
+
+@mcp.tool
+def default_branch(repo: str = ".", remote: str = "origin") -> dict:
+    """Detect the default branch from the remote (origin/HEAD), falling back to main/master."""
+    repo, e = _resolve_repo(repo)
+    if e:
+        return e
+    if not _is_repo(repo):
+        return _not_repo_err(repo)
+    sym = _run(repo, ["symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD"])
+    if sym.get("rc") == 0 and sym.get("out"):
+        branch = sym["out"].split("/", 1)[-1]
+        return ok(branch=branch, remote=remote, repo=repo)
+    for candidate in ("main", "master"):
+        if _run(repo, ["rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}"]).get("rc") == 0:
+            return ok(branch=candidate, remote=remote, repo=repo, inferred=True)
+        if _run(repo, ["rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{candidate}"]).get("rc") == 0:
+            return ok(branch=candidate, remote=remote, repo=repo, inferred=True)
+    return err("could not determine default branch", hint="pass base= explicitly to open_pr")
+
+
+@mcp.tool
+def add_remote(repo: str = ".", name: str = "", url: str = "") -> dict:
+    """Add a git remote (e.g. upstream for OSS contributions)."""
+    repo, e = _resolve_repo(repo)
+    if e:
+        return e
+    if not _is_repo(repo):
+        return _not_repo_err(repo)
+    if not _valid_refname(name):
+        return err(f"invalid remote name: {name!r}")
+    if not isinstance(url, str) or not url.strip():
+        return err("remote url is required")
+    r = _run(repo, ["remote", "add", name, url.strip()])
+    if r["rc"] != 0:
+        return err(r["errout"] or "git remote add failed", rc=r["rc"])
+    return ok(repo=repo, remote=name, url=url.strip())
+
+
+@mcp.tool
+def fork_push_instructions(repo: str = ".", fork_owner: str = "", branch: str | None = None) -> dict:
+    """Return structured steps to push a branch to your fork and open a PR upstream."""
+    repo, e = _resolve_repo(repo)
+    if e:
+        return e
+    if not _is_repo(repo):
+        return _not_repo_err(repo)
+    if branch is None:
+        branch = _run(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).get("out")
+    if not branch or branch == "HEAD":
+        return err("cannot determine branch — pass branch=")
+    upstream = remote_owner_repo(repo, "upstream")
+    origin = remote_owner_repo(repo, "origin")
+    up = upstream if upstream.get("ok") else remote_owner_repo(repo, "origin")
+    if not up.get("ok"):
+        return up
+    fork = fork_owner or (origin.get("owner") if origin.get("ok") else "")
+    if not fork:
+        return err("fork_owner required when origin owner unknown")
+    base = default_branch(repo)
+    base_name = base.get("branch", "main") if base.get("ok") else "main"
+    head = f"{fork}:{branch}"
+    steps = [
+        {"action": "push", "command": f"git push -u origin {branch}",
+         "why": "Push your feature branch to your fork (origin)."},
+        {"action": "open_pr", "head": head, "base": base_name,
+         "why": f"Open PR with head={head} against upstream {up['owner']}/{up['repo']}:{base_name}."},
+    ]
+    return ok(repo=repo, fork_owner=fork, branch=branch, head=head, base=base_name,
+              upstream_owner=up.get("owner"), upstream_repo=up.get("repo"), steps=steps)
+
+
 @mcp.tool
 def status(repo: str = ".") -> dict:
     """Working-tree status of a repo: current branch, ahead/behind, and changed files.
@@ -391,12 +510,14 @@ def _conventional_type(files: list[dict], commits: list[str]) -> str:
 
 
 @mcp.tool
-def pr_body(repo: str = ".", from_ref: str | None = None, to_ref: str = "HEAD") -> dict:
+def pr_body(repo: str = ".", from_ref: str | None = None, to_ref: str = "HEAD",
+            task: str | None = None) -> dict:
     """Synthesize a PR title + markdown description from the diff between `from_ref` and
-    `to_ref`. Assembles the skeleton — files changed, +/- stats, a conventional-commit-style
-    summary line, the commit list, and a review checklist. The agent supplies real prose; this
-    fills in the structure. If `from_ref` is omitted, compares against the merge-base with the
-    default branch (origin/HEAD or main/master), falling back to the parent of `to_ref`."""
+    `to_ref`. Optional `task` is included in the Summary section. Assembles the skeleton —
+    files changed, +/- stats, a conventional-commit-style summary line, the commit list, and a
+    review checklist. The agent supplies real prose; this fills in the structure. If `from_ref`
+    is omitted, compares against the merge-base with the default branch (origin/HEAD or
+    main/master), falling back to the parent of `to_ref`."""
     repo, e = _resolve_repo(repo)
     if e:
         return e
@@ -457,7 +578,9 @@ def pr_body(repo: str = ".", from_ref: str | None = None, to_ref: str = "HEAD") 
 
     # Markdown body.
     lines: list[str] = ["## Summary", ""]
-    if subjects:
+    if task and str(task).strip():
+        lines.append(str(task).strip())
+    elif subjects:
         lines.append(subjects[0])
     else:
         lines.append("_Describe the change here._")
@@ -499,6 +622,7 @@ def pr_body(repo: str = ".", from_ref: str | None = None, to_ref: str = "HEAD") 
         type=ctype,
         base=base,
         to_ref=to_ref,
+        task=task,
         files=files,
         files_changed=len(files),
         insertions=add_total,
@@ -528,13 +652,17 @@ def open_pr(repo: str = ".", title: str = "", body: str = "", base: str = "main"
         return err("PR title is required")
     if not _valid_refname(base):
         return err(f"invalid base branch: {base!r}")
-    if head is not None and not _valid_refname(head):
+    if head is not None and not _valid_head_ref(head):
         return err(f"invalid head branch: {head!r}")
 
     # resolve head to current branch if omitted
     if head is None:
         cur = _run(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).get("out")
         head = cur if cur and cur != "HEAD" else None
+
+    owner_info = remote_owner_repo(repo)
+    gh_owner = owner_info.get("owner") if owner_info.get("ok") else None
+    gh_repo = owner_info.get("repo") if owner_info.get("ok") else None
 
     args = ["gh", "pr", "create", "--title", title, "--body", body, "--base", base]
     if head:
@@ -545,6 +673,11 @@ def open_pr(repo: str = ".", title: str = "", body: str = "", base: str = "main"
         cmd_str += " --head " + _q(head)
 
     if not shutil.which("gh"):
+        fb_args = {"title": title, "body": body, "base": base, "head": head}
+        if gh_owner:
+            fb_args["owner"] = gh_owner
+        if gh_repo:
+            fb_args["repo"] = gh_repo
         return ok(
             created=False,
             tool_available=False,
@@ -554,12 +687,17 @@ def open_pr(repo: str = ".", title: str = "", body: str = "", base: str = "main"
             base=base,
             head=head,
             fallback={
-                "server": "github-server",
+                "server": "github",
                 "tool": "create_pull_request",
-                "args": {"title": title, "body": body, "base": base, "head": head},
+                "args": fb_args,
             },
-            hint="gh not installed: run the `command` locally, or call the github-server "
-                 "create_pull_request tool with the `fallback.args`.",
+            next_step={
+                "server": "github",
+                "tool": "create_pull_request",
+                "args": fb_args,
+            },
+            hint="gh not installed: run the `command` locally, or call the github "
+                 "create_pull_request tool with fallback.args.",
         )
 
     r = _tool(repo, args)
@@ -567,10 +705,12 @@ def open_pr(repo: str = ".", title: str = "", body: str = "", base: str = "main"
         return err(r["errout"] or r["out"] or "gh pr create failed", rc=r["rc"],
                    command=cmd_str, base=base, head=head,
                    hint="ensure the branch is pushed and `gh auth login` is done, or use "
-                        "the github-server create_pull_request tool.")
+                        "the github create_pull_request tool.")
     url = r["out"].strip().splitlines()[-1] if r["out"].strip() else None
     return ok(created=True, tool_available=True, url=url, repo=repo,
-              base=base, head=head, title=title)
+              base=base, head=head, title=title,
+              next_step={"server": "project-memory", "tool": "remember",
+                         "args": {"note": f"Opened PR: {title}", "kind": "milestone"}})
 
 
 if __name__ == "__main__":

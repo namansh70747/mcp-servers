@@ -15,6 +15,8 @@ from .config import (
     load_repo_env,
     repo_root,
 )
+from .crossdb import columns, fts_safe, normalize_email, open_ro, table_exists
+from .project import default_repo, resolve_project
 from .errors import err, not_found, ok
 from .gmail import DEFAULT_GMAIL_SCOPES, get_gmail_service, gmail_auth_status
 from .log import get_logger
@@ -31,6 +33,13 @@ __all__ = [
     "get_env_int",
     "load_repo_env",
     "repo_root",
+    "resolve_project",
+    "default_repo",
+    "open_ro",
+    "table_exists",
+    "columns",
+    "fts_safe",
+    "normalize_email",
     "get_gmail_service",
     "gmail_auth_status",
     "DEFAULT_GMAIL_SCOPES",

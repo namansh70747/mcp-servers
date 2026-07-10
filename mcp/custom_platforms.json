@@ -1,0 +1,7 @@
+{
+  "_doc": "Platform metadata for auto-discovered custom servers. Default is 'any' when absent.",
+  "mac-control": "macos",
+  "homebrew": "macos",
+  "spotify": "macos",
+  "webengine": "macos"
+}

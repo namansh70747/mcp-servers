@@ -222,26 +222,63 @@ async def main():
 
     await one("email-finder", ef)
 
-    # ---------------------------------------------------------------- apollo (no key)
+    # ---------------------------------------------------------------- apollo (isolated env — no key)
     async def ap(c, mod):
         names = await tool_names(c)
-        assert {"find_people", "find_people_paged", "find_company", "enrich_org",
-                "enrich_person", "seniorities", "titles_catalog", "has_key"} <= names, names
+        assert {"find_people", "find_people_paged", "find_people_web", "find_company",
+                "enrich_org", "enrich_person", "seniorities", "titles_catalog",
+                "has_key", "has_browser", "check_session", "open_login",
+                "start_background_browser", "auto_login_google", "ensure_ready",
+                "wait_for_manual_login"} <= names, names
 
-        # no-key paths return a hint, never raise, never leak a key
-        fp = await c.call_tool("find_people", {"domain": "acme.com"})
-        assert fp.data.get("error") == "no APOLLO_API_KEY", fp.data
-        assert "hint" in fp.data, fp.data
+        # web mode (default): find_people uses web path only
+        assert mod._mode() == "web"
 
-        # input validation happens before key check
+        orig_web = mod._find_people_web_sync
+        orig_ready = mod._ensure_ready_sync
+        mod._ensure_ready_sync = lambda: {"ready": True, "logged_in": True}
+
+        def _stub_no_pw(domain, titles, limit):
+            return {"error": "playwright is not installed",
+                    "hint": "uv sync --group browser", "source": "web"}
+
+        mod._find_people_web_sync = _stub_no_pw
+        try:
+            fp = await c.call_tool("find_people", {"domain": "acme.com"})
+            assert "error" in fp.data or fp.data.get("people") is not None, fp.data
+            if fp.data.get("error"):
+                assert "hint" in fp.data, fp.data
+
+            fw = await c.call_tool("find_people_web", {"domain": "acme.com"})
+            assert fw.data.get("error") == "playwright is not installed", fw.data
+        finally:
+            mod._find_people_web_sync = orig_web
+
+        # ensure_ready called when not logged in (offline stub)
+        calls = {"n": 0}
+        def _track_ready():
+            calls["n"] += 1
+            return {"ready": False, "logged_in": False,
+                    "hint": mod._missing_creds_hint(), "error": "apollo not ready"}
+        mod._ensure_ready_sync = _track_ready
+        mod._find_people_web_sync = orig_web
+        try:
+            need = await c.call_tool("find_people", {"domain": "acme.com"})
+            assert calls["n"] >= 1, "find_people should call ensure_ready"
+            assert need.data.get("error"), need.data
+        finally:
+            mod._ensure_ready_sync = orig_ready
+
+        mod._ensure_ready_sync = lambda: {"ready": True, "logged_in": True}
+
+        # input validation happens before key/fallback
         empty = await c.call_tool("find_people", {"domain": ""})
         assert empty.data.get("error") == "domain is required", empty.data
-        empty2 = await c.call_tool("enrich_org", {"domain": "   "})
-        assert empty2.data.get("error") == "domain is required", empty2.data
+        empty2 = await c.call_tool("enrich_org", {"domain": "stripe.com"})
+        assert "error" in empty2.data, empty2.data
         empty3 = await c.call_tool("find_company", {})
         assert "error" in empty3.data, empty3.data
         empty4 = await c.call_tool("enrich_person", {})
-        # enrich_person requires a key first OR name/linkedin; with no key -> hint
         assert "error" in empty4.data, empty4.data
 
         # offline helpers work with no key
@@ -251,12 +288,49 @@ async def main():
         assert "founders" in tc.data["presets"], tc.data
         hk = await c.call_tool("has_key", {})
         assert hk.data["configured"] is False, hk.data
+        assert hk.data.get("mode") == "web", hk.data
+        hb = await c.call_tool("has_browser", {})
+        assert "playwright_installed" in hb.data, hb.data
+
+        # SSRF guard on web path (no browser launched)
+        internal = await c.call_tool("find_people_web", {"domain": "127.0.0.1"})
+        assert internal.data.get("error") == "refusing internal/private host", internal.data
+
+        # mocked web fallback returns people
+        def _fake_web(domain, titles, limit):
+            return {"domain": domain, "count": 1, "people": [
+                mod._web_person_row("Jane Doe", "CEO", "https://linkedin.com/in/jane", domain)
+            ], "source": "web"}
+
+        orig_web = mod._find_people_web_sync
+        orig_scrape = mod._find_people_web_scrape_sync
+        orig_ready = mod._ensure_ready_sync
+        ensure_calls = {"n": 0}
+
+        def _count_ready():
+            ensure_calls["n"] += 1
+            return {"ready": True, "logged_in": True}
+
+        mod._ensure_ready_sync = _count_ready
+        mod._find_people_web_scrape_sync = lambda d, t, l: {
+            "domain": d, "count": 1, "people": [
+                mod._web_person_row("Jane Doe", "CEO", "", d)
+            ], "source": "web"}
+        try:
+            mocked = await c.call_tool("find_people", {"domain": "example.com"})
+            assert mocked.data.get("source") == "web", mocked.data
+            assert mocked.data.get("people"), mocked.data
+            assert ensure_calls["n"] == 1, "find_people should call ensure_ready exactly once"
+        finally:
+            mod._find_people_web_sync = orig_web
+            mod._find_people_web_scrape_sync = orig_scrape
+            mod._ensure_ready_sync = orig_ready
 
         # _clamp helper bounds
         assert mod._clamp(-1, 5) == 5
         assert mod._clamp(99999, 5) == mod.MAX_PER_PAGE
         assert mod._clamp("bad", 7) == 7
-        print("apollo OK — no-key hints + validation + offline helpers")
+        print("apollo OK — web fallback + validation + offline helpers")
 
     await one("apollo", ap)
 

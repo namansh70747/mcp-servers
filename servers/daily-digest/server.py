@@ -43,6 +43,8 @@ SOURCES = (
     "learn-tracker",
     "habit-tracker",
     "interview-prep",
+    "campaign",
+    "codeindex",
 )
 
 # Urgency ranking (lower sorts first / is more urgent).
@@ -355,6 +357,73 @@ def _collect_interview_prep() -> list[dict]:
         conn.close()
 
 
+def _collect_campaign() -> list[dict]:
+    conn = _connect_ro("campaign")
+    if conn is None:
+        return []
+    try:
+        if not _table_exists(conn, "ledger"):
+            return []
+        cols = _columns(conn, "ledger")
+        if "cooldown_until" not in cols:
+            return []
+        now_iso = _now().isoformat()
+        rows = _safe_rows(
+            conn,
+            "SELECT id, company, domain, cooldown_until FROM ledger "
+            "WHERE cooldown_until IS NOT NULL AND cooldown_until != '' AND cooldown_until <= ?",
+            (now_iso,),
+        )
+        items: list[dict] = []
+        for r in rows:
+            label = f"Campaign cooldown ended: {r['company'] or r['domain'] or '?'}"
+            items.append(_item("campaign", label, r["cooldown_until"], urgency="due_today", ref=r["id"]))
+        if _table_exists(conn, "suppression"):
+            sup_rows = _safe_rows(
+                conn,
+                "SELECT id, value, kind, reason FROM suppression LIMIT 50",
+            )
+            for r in sup_rows:
+                items.append(_item(
+                    "campaign",
+                    f"Suppression active: {r['value']} ({r['kind']})",
+                    None,
+                    urgency="open",
+                    ref=r["id"],
+                ))
+        return items
+    finally:
+        conn.close()
+
+
+def _collect_codeindex(stale_days: int = 7) -> list[dict]:
+    conn = _connect_ro("codeindex")
+    if conn is None:
+        return []
+    try:
+        if not _table_exists(conn, "meta"):
+            return []
+        row = _safe_rows(conn, "SELECT value FROM meta WHERE key='last_indexed' LIMIT 1")
+        if not row:
+            return [_item("codeindex", "Code index never built — run codeindex.index_project",
+                          None, urgency="due_today")]
+        last = row[0]["value"]
+        dt = _parse_dt(last)
+        if dt is None:
+            return []
+        age = (_now() - dt).days
+        if age >= stale_days:
+            return [_item(
+                "codeindex",
+                f"Code index stale ({age}d) — re-run codeindex.index_project",
+                last,
+                urgency="due_soon" if age < stale_days * 2 else "overdue",
+            )]
+        return []
+    finally:
+        conn.close()
+
+
 _COLLECTORS = {
     "task-manager": _collect_task_manager,
     "jobtrack": _collect_jobtrack,
@@ -362,6 +431,8 @@ _COLLECTORS = {
     "learn-tracker": _collect_learn_tracker,
     "habit-tracker": _collect_habit_tracker,
     "interview-prep": _collect_interview_prep,
+    "campaign": _collect_campaign,
+    "codeindex": _collect_codeindex,
 }
 
 
@@ -454,7 +525,7 @@ def source(name: str, limit: int = 50) -> dict:
     """Drill into a single source server's due items (read-only).
 
     `name` must be one of: task-manager, jobtrack, reachout, learn-tracker,
-    habit-tracker, interview-prep.
+    habit-tracker, interview-prep, campaign, codeindex.
     """
     if name not in _COLLECTORS:
         # Actionable not-found: name what's missing AND the valid sources, plus a recovery hint.

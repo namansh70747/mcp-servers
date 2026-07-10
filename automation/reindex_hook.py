@@ -1,11 +1,21 @@
 """Reindex a repo with codeindex and refresh its CLAUDE.md/AGENTS.md context files.
-Called by the post-commit hook (install_hooks.sh). Usage: reindex_hook.py [repo_path]"""
+Called by the post-commit hook (install_hooks.sh / install_hooks.ps1).
+Usage: reindex_hook.py [repo_path]"""
 import asyncio
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
-SUITE = Path("/Users/namansharma/mcp-servers")
+
+def _suite_root() -> Path:
+    env = os.environ.get("MCP_SUITE_ROOT", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parents[1]
+
+
+SUITE = _suite_root()
 repo = str(Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve())
 
 spec = importlib.util.spec_from_file_location("codeindex_srv", SUITE / "servers" / "codeindex" / "server.py")

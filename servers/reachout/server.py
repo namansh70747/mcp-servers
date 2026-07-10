@@ -19,7 +19,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 from jinja2 import Template
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, ok, normalize_email
 
 mcp = make_server(
     "reachout",
@@ -297,7 +297,22 @@ def create_draft(to_email: str, subject: str, body: str, recipient_name: str = "
          variant, sequence_id, step, contact_id, _now()),
     )
     _log_event(oid, "drafted", template_used)
-    return {"draft_id": draft["id"], "gmail_message_id": draft["message"]["id"], "outreach_id": oid}
+    return ok(
+        draft_id=draft["id"],
+        gmail_message_id=draft["message"]["id"],
+        outreach_id=oid,
+        next_step={
+            "server": "campaign",
+            "tool": "record_outreach",
+            "args": {
+                "company": company,
+                "domain": "",
+                "email": normalize_email(to_email),
+                "contact_name": recipient_name,
+            },
+        },
+        context={"company": company, "email": normalize_email(to_email)},
+    )
 
 
 @mcp.tool
@@ -340,9 +355,36 @@ def send_email(to_email: str, subject: str, body: str, recipient_name: str = "",
     return {"gmail_message_id": sent["id"], "outreach_id": oid, "status": "sent"}
 
 
+def _sync_campaign_record(company: str, domain: str, email: str, contact_name: str = "") -> dict | None:
+    """Best-effort sync to campaign ledger after a send."""
+    try:
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        sp = Path(__file__).resolve().parent.parent / "campaign" / "server.py"
+        mod_name = "_reachout_campaign_sync"
+        spec = importlib.util.spec_from_file_location(mod_name, sp)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        fn = getattr(mod, "record_outreach", None)
+        if callable(fn):
+            return fn(
+                company=company or "",
+                domain=domain or "",
+                email=normalize_email(email),
+                contact_name=contact_name or "",
+            )
+    except Exception:
+        return None
+    return None
+
+
 @mcp.tool
-def send_draft(draft_id: str) -> dict:
-    """Send a previously created draft and mark it sent."""
+def send_draft(draft_id: str, sync_campaign: bool = True) -> dict:
+    """Send a previously created draft and mark it sent. When sync_campaign=True, updates the
+    campaign dedup ledger automatically."""
     if not draft_id:
         return {"error": "draft_id is required"}
     service, gerr = _gmail_or_err()
@@ -354,9 +396,26 @@ def send_draft(draft_id: str) -> dict:
         return err(f"{type(e).__name__}: {e}", code="gmail_error")
     store.execute("UPDATE outreach SET status='sent', sent_at=? WHERE gmail_message_id=?",
                   (_now(), sent["id"]))
-    row = store.query_one("SELECT id FROM outreach WHERE gmail_message_id=?", (sent["id"],))
+    row = store.query_one(
+        "SELECT id, company, recipient_email, recipient_name FROM outreach WHERE gmail_message_id=?",
+        (sent["id"],),
+    )
     _log_event(row["id"] if row else None, "sent", "from_draft")
-    return {"gmail_message_id": sent["id"], "status": "sent"}
+    campaign_sync = None
+    if sync_campaign and row:
+        campaign_sync = _sync_campaign_record(
+            row.get("company") or "",
+            "",
+            row.get("recipient_email") or "",
+            row.get("recipient_name") or "",
+        )
+    return ok(
+        gmail_message_id=sent["id"],
+        status="sent",
+        outreach_id=row["id"] if row else None,
+        campaign_synced=bool(campaign_sync),
+        context={"email": normalize_email(row.get("recipient_email") if row else "")},
+    )
 
 
 @mcp.tool

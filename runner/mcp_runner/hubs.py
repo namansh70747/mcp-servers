@@ -3,44 +3,55 @@
 Each hub is one FastMCP process that re-exposes many sub-servers' tools under namespaced
 names (e.g. `notes_search`, `spotify_play_song`). Custom Python servers are mounted in-process
 (cheap — same venv); ready-made stdio servers are proxied (the hub spawns them as subprocesses).
-
-`ready_spec(name)` resolves the canonical specs from mcp/servers.base.json to absolute local
-paths — the hub is a normal Python process, free of Qwen's bare-`npx`/`uvx` restriction, so it
-can use the github binary and the absolute uvx path directly for reliability.
 """
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from mcp_base import repo_root
 
-# uvx caches this runner package in an isolated dir, so __file__-based paths break. Prefer an
-# explicit MCP_SUITE_ROOT (set in the Qwen config env); fall back to repo_root() (editable
-# mcp-base -> <repo>/shared, which resolves to the real repo).
 REPO_ROOT = Path(os.environ.get("MCP_SUITE_ROOT") or repo_root())
+IS_DARWIN = sys.platform == "darwin"
+
+_MACOS_READY = {
+    "applescript", "shortcuts", "messages", "apple-events", "apple-notes", "screenshot", "spotlight",
+}
+_MACOS_CUSTOM = {"mac-control", "homebrew", "spotify", "webengine"}
+
+
+def _platform_ok(name: str, *, custom: bool) -> bool:
+    if IS_DARWIN:
+        return True
+    if custom:
+        return name not in _MACOS_CUSTOM
+    return name not in _MACOS_READY
 
 
 def _uvx() -> str:
-    """Absolute path to uvx (falls back to bare 'uvx' on PATH)."""
-    local = Path.home() / ".local" / "bin" / "uvx"
+    local = Path.home() / ".local" / "bin" / ("uvx.exe" if sys.platform == "win32" else "uvx")
     if local.exists():
         return str(local)
     return shutil.which("uvx") or "uvx"
 
 
 def _github_bin() -> str:
-    return str(REPO_ROOT / "bin" / "github-mcp-server")
+    base = REPO_ROOT / "bin" / "github-mcp-server"
+    if sys.platform == "win32":
+        exe = base.with_suffix(".exe")
+        return str(exe if exe.exists() else base)
+    return str(base)
 
 
 def _env(*keys: str) -> dict:
-    """Collect named env vars that are actually set (loaded from .env by mcp_base)."""
     return {k: os.environ[k] for k in keys if os.environ.get(k)}
 
 
-# Ready-made stdio servers, resolved to absolute local commands.
 def ready_spec(name: str) -> dict | None:
+    if not _platform_ok(name, custom=False):
+        return None
     uvx = _uvx()
     root = str(REPO_ROOT)
     specs: dict[str, dict] = {
@@ -71,8 +82,9 @@ def ready_spec(name: str) -> dict | None:
 HUBS: dict[str, dict] = {
     "dev": {
         "custom": ["codeindex", "codeedit", "gitflow", "repo-health", "snippet-vault",
-                   "scaffold", "api-tester", "devlog", "readme-changelog", "github-profile"],
-        "ready": ["filesystem", "git", "github"],
+                   "scaffold", "api-tester", "devlog", "readme-changelog", "github-profile",
+                   "project-memory", "recipes"],
+        "ready": ["filesystem", "git", "github", "fetch", "duckduckgo"],
     },
     "outreach": {
         "custom": ["reachout", "mailbox", "mailmerge", "campaign", "contacts", "funding-radar",
@@ -87,7 +99,7 @@ HUBS: dict[str, dict] = {
     },
     "prod": {
         "custom": ["task-manager", "time-tracker", "habit-tracker", "notes", "bookmark-vault",
-                   "expense-tracker", "rss-reader", "daily-digest", "recipes", "project-memory"],
+                   "expense-tracker", "rss-reader", "daily-digest"],
         "ready": ["memory", "fetch", "duckduckgo"],
     },
     "system": {
@@ -96,3 +108,12 @@ HUBS: dict[str, dict] = {
                   "screenshot", "spotlight", "playwright"],
     },
 }
+
+
+def hub_servers(hub_id: str) -> dict:
+    """Return filtered custom/ready lists for a hub on this platform."""
+    spec = HUBS[hub_id]
+    return {
+        "custom": [s for s in spec.get("custom", []) if _platform_ok(s, custom=True)],
+        "ready": [s for s in spec.get("ready", []) if _platform_ok(s, custom=False)],
+    }

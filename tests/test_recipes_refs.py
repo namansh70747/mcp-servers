@@ -55,6 +55,10 @@ async def collect_recipe_steps(recipes_mod) -> list[dict]:
         ("apply_to_job", {"jd_text": "We need a Python engineer with FTS5 experience."}),
         ("daily_briefing", {}),
         ("ship_project", {"repo": "/tmp/example-repo"}),
+        ("make_change", {"task": "add logging", "repo": str(ROOT)}),
+        ("review_and_pr", {"task": "fix bug", "repo": str(ROOT)}),
+        ("contribute_upstream", {"upstream_owner": "acme", "upstream_repo": "widget", "task": "fix"}),
+        ("triage_issue", {"repo": str(ROOT), "title": "bug", "body": "details"}),
     ]
     async with Client(recipes_mod.mcp) as c:
         listed = {t.name for t in await c.list_tools()}
@@ -80,8 +84,12 @@ async def main():
     assert steps, "no steps emitted by any playbook"
 
     problems = []
+    # ready-made github server is not under servers/ — skip external refs in validation
+    external_ok = {("github", "fork_repository"), ("github", "issue_write")}
     for s in steps:
         srv, tool = s.get("server"), s.get("tool")
+        if (srv, tool) in external_ok:
+            continue
         if srv not in tool_map:
             problems.append(f"[{s['_recipe']}] unknown server '{srv}' (tool '{tool}')")
         elif tool not in tool_map[srv]:

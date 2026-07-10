@@ -68,13 +68,13 @@ def hub_main() -> None:
 
     from mcp_base import make_server  # noqa: E402 — also triggers .env autoload
 
-    from .hubs import HUBS, ready_spec
+    from .hubs import HUBS, hub_servers, ready_spec
 
     name = sys.argv[1]
-    spec = HUBS.get(name)
-    if spec is None:
+    if name not in HUBS:
         print(f"run-mcp-hub: unknown hub '{name}' (have: {', '.join(HUBS)})", file=sys.stderr)
         sys.exit(1)
+    spec = hub_servers(name)
 
     hub = make_server(
         f"{name}-hub",

@@ -453,23 +453,13 @@ def _emails_from_html(html: str) -> dict[str, int]:
 
 
 def _fetch_page_text(url: str, timeout: float = 15.0) -> str:
-    """Fetch one page's HTML, SSRF-guarded, html-only, size-capped, no redirects. '' on any failure."""
-    try:
-        full = url if url.startswith("http") else f"https://{url}"
-        parts = urlsplit(full)
-        if parts.scheme not in ("http", "https"):
-            return ""
-        host = (parts.hostname or "").lower()
-        if not host or _is_internal_host(host):
-            return ""
-        with httpx.Client(timeout=timeout, follow_redirects=False,
-                          headers={"User-Agent": "Mozilla/5.0 (mcp-suite email-finder)"}) as client:
-            r = client.get(full)
-            if r.status_code != 200 or "text/html" not in r.headers.get("content-type", ""):
-                return ""
-            return r.text[:MAX_PAGE_BYTES]
-    except Exception:
+    """Fetch one page's HTML via hardened shared fetch (redirects, retries, SSRF guard)."""
+    from mcp_base.fetch import fetch as hfetch
+
+    r = hfetch(url, timeout=timeout, max_bytes=MAX_PAGE_BYTES)
+    if not r.get("ok"):
         return ""
+    return (r.get("html") or "")[:MAX_PAGE_BYTES]
 
 
 @mcp.tool
@@ -657,10 +647,18 @@ def _norm_result_link(href: str) -> str:
     return href
 
 
+def _engine_html(url: str, params: dict) -> str:
+    """Fetch raw search-engine HTML. '' on failure."""
+    try:
+        return http.get_text(url, params=params, headers={"User-Agent": _BROWSER_UA},
+                             timeout=20, cache_ttl=900.0) or ""
+    except Exception:
+        return ""
+
+
 def _engine_links(url: str, params: dict, selectors: list[str], max_links: int) -> list[str]:
     """Run one keyless search engine, parse result anchors, return normalized target URLs."""
-    html_text = http.get_text(url, params=params, headers={"User-Agent": _BROWSER_UA},
-                              timeout=20, cache_ttl=900.0)
+    html_text = _engine_html(url, params)
     if not html_text:
         return []
     try:
@@ -682,6 +680,98 @@ def _engine_links(url: str, params: dict, selectors: list[str], max_links: int) 
         if len(links) >= max_links:
             break
     return links
+
+
+def _ddg_html(query: str) -> str:
+    headers = {"User-Agent": _BROWSER_UA}
+    for endpoint in ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"):
+        try:
+            html_text = http.get_text(endpoint, params={"q": query}, headers=headers,
+                                      timeout=20, cache_ttl=900.0)
+            if html_text:
+                return html_text
+        except Exception:
+            continue
+    return ""
+
+
+def _bing_html(query: str) -> str:
+    return _engine_html("https://www.bing.com/search", {"q": query})
+
+
+def _mojeek_html(query: str) -> str:
+    return _engine_html("https://www.mojeek.com/search", {"q": query})
+
+
+def _snippets_from_html(html_text: str, max_snippets: int = 6) -> list[str]:
+    """Extract short text snippets from search result HTML."""
+    if not html_text:
+        return []
+    snippets: list[str] = []
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_text, "html.parser")
+        for sel in (".b_caption p", ".result__snippet", "p.ob", "li.result p", "div.snippet"):
+            for el in soup.select(sel):
+                t = el.get_text(" ", strip=True)
+                if t and len(t) > 20 and t not in snippets:
+                    snippets.append(t[:240])
+                if len(snippets) >= max_snippets:
+                    return snippets
+    except Exception:
+        pass
+    if not snippets:
+        plain = re.sub(r"<[^>]+>", " ", html_text)
+        for chunk in re.split(r"\s{2,}", plain):
+            chunk = chunk.strip()
+            if len(chunk) > 40 and chunk not in snippets:
+                snippets.append(chunk[:240])
+            if len(snippets) >= max_snippets:
+                break
+    return snippets
+
+
+def _search_snippets_merged(query: str, max_links: int = 8) -> dict:
+    """Union URLs + LinkedIn URLs + text snippets across DDG, Bing, Mojeek."""
+    merged_urls: list[str] = []
+    merged_li: list[str] = []
+    merged_snippets: list[str] = []
+    engines = (
+        ("ddg", _ddg_html, _ddg_result_links),
+        ("bing", _bing_html, _bing_links),
+        ("mojeek", _mojeek_html, _mojeek_links),
+    )
+    for _name, html_fn, links_fn in engines:
+        html_text = ""
+        try:
+            html_text = html_fn(query)
+        except Exception:
+            html_text = ""
+        if html_text:
+            for li in _extract_linkedin_urls(html_text):
+                if li not in merged_li:
+                    merged_li.append(li)
+            for sn in _snippets_from_html(html_text):
+                if sn not in merged_snippets:
+                    merged_snippets.append(sn)
+        try:
+            links = links_fn(query, max_links)
+        except Exception:
+            links = []
+        for u in links:
+            if u and u not in merged_urls:
+                merged_urls.append(u)
+            if "linkedin.com/in/" in u.lower():
+                norm = u.split("?")[0].rstrip("/")
+                if norm not in merged_li:
+                    merged_li.append(norm)
+            if len(merged_urls) >= max_links and len(merged_li) >= max_links:
+                break
+    return {
+        "urls": merged_urls[:max_links],
+        "linkedin_urls": merged_li[:max_links],
+        "snippets": merged_snippets[:max_links],
+    }
 
 
 def _bing_links(query: str, max_links: int = 5) -> list[str]:
@@ -713,6 +803,81 @@ def _search_links(query: str, max_links: int = 5) -> list[str]:
     return []
 
 
+def _search_links_merged(query: str, max_links: int = 8) -> list[str]:
+    """Union + dedupe result URLs across DDG, Bing, and Mojeek. More robust than first-wins."""
+    merged: list[str] = []
+    for fn in (_ddg_result_links, _bing_links, _mojeek_links):
+        try:
+            links = fn(query, max_links)
+        except Exception:
+            links = []
+        for u in links:
+            if u and u not in merged:
+                merged.append(u)
+            if len(merged) >= max_links:
+                return merged[:max_links]
+    return merged
+
+
+_LINKEDIN_IN_RE = re.compile(r"https?://(?:[a-z]+\.)?linkedin\.com/in/[A-Za-z0-9\-_%]+/?", re.I)
+
+
+def _extract_linkedin_urls(text: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _LINKEDIN_IN_RE.finditer(text or ""):
+        u = m.group(0).rstrip("/")
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _discover_linkedin_urls(name: str, company: str = "", title: str = "") -> list[dict]:
+    """Targeted multi-engine search for LinkedIn /in/ profile URLs. Never raises."""
+    name = (name or "").strip()
+    if not name:
+        return []
+    queries: list[str] = []
+    if company:
+        queries.append(f'site:linkedin.com/in "{name}" "{company}"')
+        queries.append(f'site:linkedin.com "{name}" "{company}"')
+        queries.append(f'"{name}" "{company}" linkedin.com/in')
+        queries.append(f'"{name}" "{company}" linkedin')
+    if title and company:
+        queries.append(f'"{name}" {title} {company}')
+        queries.append(f'"{name}" CTO "{company}"')
+    queries.append(f'"{name}" linkedin profile')
+    hits: dict[str, dict] = {}
+    for q in queries:
+        pack = _search_snippets_merged(q, max_links=8)
+        snippet_blob = " ".join(pack.get("snippets") or [])
+        for url in pack.get("urls") or []:
+            if "linkedin.com/in/" not in url.lower():
+                continue
+            norm = url.split("?")[0].rstrip("/")
+            if norm not in hits:
+                hits[norm] = {
+                    "linkedin_url": norm,
+                    "source_url": url,
+                    "query": q,
+                    "snippet": snippet_blob[:240] or q,
+                }
+        for norm in pack.get("linkedin_urls") or []:
+            if norm not in hits:
+                hits[norm] = {
+                    "linkedin_url": norm,
+                    "source_url": norm,
+                    "query": q,
+                    "snippet": snippet_blob[:240] or q,
+                }
+            if len(hits) >= 8:
+                break
+        if len(hits) >= 8:
+            break
+    return list(hits.values())
+
+
 def _web_search_emails(name: str, domain: str = "", company: str = "",
                        max_results: int = 8) -> list[dict]:
     """Discover a person's published emails via keyless DuckDuckGo search. Never raises; [] on fail.
@@ -729,7 +894,7 @@ def _web_search_emails(name: str, domain: str = "", company: str = "",
     queries.append(f'"{name}" email contact')
     urls: list[str] = []
     for q in queries:
-        for u in _search_links(q, max_links=5):
+        for u in _search_links_merged(q, max_links=5):
             if u not in urls:
                 urls.append(u)
         if len(urls) >= max_results:
@@ -798,6 +963,15 @@ def _wayback_emails(domain: str, name: str, max_snaps: int = 4) -> list[dict]:
                 out[em] = {"email": em, "source_url": f"web.archive.org/{ts}", "weight": score,
                            "role": _is_role(em), "on_domain": on_domain}
     return sorted(out.values(), key=lambda d: -d["weight"])
+
+
+@mcp.tool
+def discover_linkedin(name: str, company: str = "", title: str = "") -> dict:
+    """Discover LinkedIn /in/ profile URLs for a named person via multi-engine web search (DDG+Bing+Mojeek).
+    No API key. Use before Apollo to disambiguate common names."""
+    hits = _discover_linkedin_urls(name, company, title)
+    return {"name": name, "company": company or None, "title": title or None,
+            "results": hits, "count": len(hits)}
 
 
 @mcp.tool

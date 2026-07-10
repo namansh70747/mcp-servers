@@ -10,11 +10,21 @@ from __future__ import annotations
 from typing import Any
 
 
-def ok(data: Any = None, **fields: Any) -> dict:
-    """Success envelope. Pass a value as `data` and/or extra named fields."""
+def ok(data: Any = None, *, next_step: dict | None = None, context: dict | None = None,
+       **fields: Any) -> dict:
+    """Success envelope. Pass a value as `data` and/or extra named fields.
+
+    Optional v2 fields:
+        next_step: {"server", "tool", "args"} — suggested follow-up for the agent
+        context: shared session metadata (e.g. project path)
+    """
     out: dict = {"ok": True}
     if data is not None:
         out["data"] = data
+    if next_step is not None:
+        out["next_step"] = next_step
+    if context is not None:
+        out["context"] = context
     out.update(fields)
     return out
 

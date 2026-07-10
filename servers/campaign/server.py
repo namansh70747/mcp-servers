@@ -12,7 +12,7 @@ import csv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found
+from mcp_base import BaseStore, data_dir, db_path, err, make_server, not_found, normalize_email
 
 mcp = make_server(
     "campaign",
@@ -113,6 +113,7 @@ def record_outreach(company: str, domain: str = "", contacts: str = "", email: s
     Optionally log a specific contact (email/contact_name) and set a per-company cooldown_days
     after which it may be re-targeted (0 = never again). Optional gmail_message_id/thread_id link
     the per-send log row back to the actual Gmail message (P2 cross-server identity)."""
+    email = normalize_email(email)
     now = _now()
     now_iso = now.isoformat()
     cooldown_until = (now + timedelta(days=cooldown_days)).isoformat() if cooldown_days > 0 else None

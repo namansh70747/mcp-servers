@@ -1,15 +1,15 @@
 {
   "name": "Naman Sharma",
-  "email": "",
+  "email": "namsh70747@gmail.com",
   "phone": "",
   "location": "",
   "links": {
-    "github": "",
+    "github": "namansh70747",
     "linkedin": "",
-    "website": "",
+    "website": "https://github.com/namansh70747",
     "twitter": ""
   },
-  "headline": "Early-career software developer",
+  "headline": "Go developer working on container runtimes, VMM internals, and Kubernetes infrastructure",
   "summary": "",
   "skills": {
     "languages": [],

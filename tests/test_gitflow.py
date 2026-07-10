@@ -53,7 +53,8 @@ async def test_gitflow():
     async with Client(load("gitflow")) as c:
         ts = await tools(c)
         contract = {"status", "current_branch", "create_branch", "stage", "commit",
-                    "push", "diff", "log", "pr_body", "open_pr"}
+                    "push", "diff", "log", "pr_body", "open_pr", "remote_owner_repo",
+                    "default_branch", "add_remote", "fork_push_instructions"}
         assert contract <= ts, f"missing contract tools: {contract - ts}"
 
         # current_branch
@@ -113,6 +114,10 @@ async def test_gitflow():
         assert pb["files_changed"] >= 1 and "app.py" in {f["file"] for f in pb["files"]}, pb
         assert "feat: add app" in pb["commits"], pb
 
+        # pr_body accepts optional task
+        pb_task = await call(c, "pr_body", {"repo": repo, "task": "implement feature X"})
+        assert pb_task["ok"] and "implement feature X" in pb_task["body"], pb_task
+
         # pr_body with default base (auto-detect) still works
         pb2 = await call(c, "pr_body", {"repo": repo})
         assert pb2["ok"] and pb2["title"], pb2
@@ -131,6 +136,7 @@ async def test_gitflow():
         if op["ok"]:
             # gh missing -> degraded command path
             assert op["created"] is False and op["command"].startswith("gh pr create"), op
+            assert op["fallback"]["server"] == "github", op
             assert op["fallback"]["tool"] == "create_pull_request", op
         else:
             # gh present but the temp repo has no remote/auth -> structured error w/ command
